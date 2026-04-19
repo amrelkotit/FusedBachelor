@@ -8,7 +8,7 @@ import os
 from src.preprocessing.preprocessing import preprocess
 
 
-dataset_path = r"E:\El Gam3a\My bachelor\Fused bachelor\data\raw\final_dataset\AANLIB"
+dataset_path = r"E:\El Gam3a\My bachelor\Fused bachelor\data\raw\final_dataset\AANLIB\train"
 
 ct_path = os.path.join(dataset_path, "CT")
 mri_path = os.path.join(dataset_path, "MRI")
