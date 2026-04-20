@@ -1,9 +1,9 @@
+import numpy as np
 import torch
 import torch.nn as nn
-import cv2
-import numpy as np
+
+from src.fusion.decomposition import multiscale_fuse
 from src.models.feature_extractor import MultiScaleFeatureExtractor
-from src.preprocessing.preprocessing import enhance_image
 
 
 class FusionNet(nn.Module):
@@ -12,61 +12,33 @@ class FusionNet(nn.Module):
 
         self.feature_extractor = MultiScaleFeatureExtractor()
 
-        # Decoder
         self.decoder = nn.Sequential(
             nn.Conv2d(64, 32, kernel_size=3, padding=1),
             nn.ReLU(),
-
             nn.Conv2d(32, 16, kernel_size=3, padding=1),
             nn.ReLU(),
-
             nn.Conv2d(16, 1, kernel_size=3, padding=1),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
 
     def forward(self, mri, ct):
         feat_mri = self.feature_extractor(mri)
-        feat_ct  = self.feature_extractor(ct)
+        feat_ct = self.feature_extractor(ct)
 
-        # 🔥 Max Fusion (best before training)
+        # Feature-level max fusion preserves the strongest modality response.
         fused = torch.max(feat_mri, feat_ct)
+        return self.decoder(fused)
 
-        output = self.decoder(fused)
 
-        return output
-    
-def fuse_images(ct, mri):
+def fuse_images(ct, mri, levels=3):
+    """Fuse one CT/MRI pair with the practical multi-scale decomposition rule.
 
-    # 🔥 Convert Tensor → NumPy
-    if hasattr(ct, "numpy"):
-        ct = ct.squeeze().cpu().numpy()
+    This helper keeps the original public API used by main.py, but moves the
+    actual fusion logic to src.fusion.decomposition.
+    """
+    with torch.no_grad():
+        fused = multiscale_fuse(mri=mri, ct=ct, levels=levels)
 
-    if hasattr(mri, "numpy"):
-        mri = mri.squeeze().cpu().numpy()
-
-    # Continue normally
-    ct = enhance_image(ct)
-    mri = enhance_image(mri)
-
-    # Low-frequency
-    low_ct = cv2.GaussianBlur(ct, (5,5), 0)
-    low_mri = cv2.GaussianBlur(mri, (5,5), 0)
-
-    # High-frequency
-    high_ct = ct - low_ct
-    high_mri = mri - low_mri
-
-    # Fusion
-    low_fused = 0.5 * low_ct + 0.5 * low_mri
-    high_fused = 0.8 * high_ct + 0.8 * high_mri
-
-    fused = low_fused + high_fused
-
-    # Smooth
-    fused = cv2.GaussianBlur(fused, (3,3), 0)
-
-    # Normalize
-    fused = cv2.normalize(fused, None, 0, 255, cv2.NORM_MINMAX)
-    fused = fused.astype(np.uint8)
-
-    return fused
+    fused_np = fused.squeeze().detach().cpu().numpy()
+    fused_np = np.clip(fused_np, 0.0, 1.0)
+    return (fused_np * 255.0).astype(np.uint8)
