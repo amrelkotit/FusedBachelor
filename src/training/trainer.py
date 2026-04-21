@@ -33,12 +33,16 @@ class GANFusionTrainer:
         num_workers=0,
         device=None,
         max_items=None,
+        resume=None,
+        auto_resume=False,
     ):
         self.dataset_root = dataset_root
         self.output_dir = Path(output_dir)
         self.checkpoint_dir = self.output_dir / "checkpoints"
         self.sample_dir = self.output_dir / "samples"
         self.epochs = epochs
+        self.start_epoch = 1
+        self.best_metric = float("-inf")
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
         dataset = PairedMedicalImageDataset(dataset_root, image_size=image_size, max_items=max_items)
@@ -72,6 +76,85 @@ class GANFusionTrainer:
         self.optimizer_g = torch.optim.Adam(self.generator.parameters(), lr=lr, betas=(0.5, 0.999))
         self.optimizer_d1 = torch.optim.Adam(self.discriminator1.parameters(), lr=lr, betas=(0.5, 0.999))
         self.optimizer_d2 = torch.optim.Adam(self.discriminator2.parameters(), lr=lr, betas=(0.5, 0.999))
+
+        if resume and auto_resume:
+            raise ValueError("Use either resume or auto_resume, not both.")
+        if resume:
+            self.load_checkpoint(resume)
+        elif auto_resume:
+            latest_checkpoint = self.find_latest_checkpoint()
+            if latest_checkpoint is None:
+                print(f"No checkpoint found in {self.checkpoint_dir}. Starting from scratch.")
+            else:
+                self.load_checkpoint(latest_checkpoint)
+
+    def find_latest_checkpoint(self):
+        if not self.checkpoint_dir.exists():
+            return None
+
+        checkpoints = []
+        for path in self.checkpoint_dir.glob("gan_epoch_*.pt"):
+            try:
+                epoch = int(path.stem.split("_")[-1])
+            except ValueError:
+                continue
+            checkpoints.append((epoch, path))
+
+        if not checkpoints:
+            return None
+        return max(checkpoints, key=lambda item: item[0])[1]
+
+    def load_checkpoint(self, checkpoint_path):
+        checkpoint_path = Path(checkpoint_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
+
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        required_keys = [
+            "epoch",
+            "generator",
+            "discriminator1",
+            "discriminator2",
+            "optimizer_g",
+            "optimizer_d1",
+            "optimizer_d2",
+        ]
+        missing_keys = [key for key in required_keys if key not in checkpoint]
+        if missing_keys:
+            raise KeyError(f"Checkpoint is missing keys: {missing_keys}")
+
+        self.generator.load_state_dict(checkpoint["generator"])
+        self.discriminator1.load_state_dict(checkpoint["discriminator1"])
+        self.discriminator2.load_state_dict(checkpoint["discriminator2"])
+        self.optimizer_g.load_state_dict(checkpoint["optimizer_g"])
+        self.optimizer_d1.load_state_dict(checkpoint["optimizer_d1"])
+        self.optimizer_d2.load_state_dict(checkpoint["optimizer_d2"])
+        self.best_metric = float(checkpoint.get("best_metric", self.best_metric))
+
+        saved_epoch = int(checkpoint["epoch"])
+        self.start_epoch = saved_epoch + 1
+        print(f"Loaded checkpoint: {checkpoint_path}")
+        print(f"Resuming from epoch {self.start_epoch}")
+
+    def save_best_checkpoint(self, epoch, validation_score):
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        full_path = self.checkpoint_dir / "best_checkpoint.pt"
+        generator_path = self.checkpoint_dir / "best_generator.pt"
+        torch.save(
+            {
+                "epoch": epoch,
+                "best_metric": validation_score,
+                "generator": self.generator.state_dict(),
+                "discriminator1": self.discriminator1.state_dict(),
+                "discriminator2": self.discriminator2.state_dict(),
+                "optimizer_g": self.optimizer_g.state_dict(),
+                "optimizer_d1": self.optimizer_d1.state_dict(),
+                "optimizer_d2": self.optimizer_d2.state_dict(),
+            },
+            full_path,
+        )
+        torch.save(self.generator.state_dict(), generator_path)
+        return full_path, generator_path
 
     def _real_style_target(self, ct, mri):
         """D2 sees source-domain realism from real CT/MRI, alternating by batch."""
@@ -174,6 +257,7 @@ class GANFusionTrainer:
                 "optimizer_g": self.optimizer_g.state_dict(),
                 "optimizer_d1": self.optimizer_d1.state_dict(),
                 "optimizer_d2": self.optimizer_d2.state_dict(),
+                "best_metric": self.best_metric,
             },
             path,
         )
@@ -182,9 +266,23 @@ class GANFusionTrainer:
 
     def fit(self):
         print(f"Training on device: {self.device}")
-        for epoch in range(1, self.epochs + 1):
+        if self.start_epoch > self.epochs:
+            print(
+                f"Checkpoint is already at epoch {self.start_epoch - 1}. "
+                f"Requested total epochs: {self.epochs}. Nothing to train."
+            )
+            return
+
+        for epoch in range(self.start_epoch, self.epochs + 1):
             train_losses = self.train_epoch(epoch)
             val_metrics = self.validate(epoch)
+            best_updated = False
+            if val_metrics:
+                validation_score = 0.5 * (val_metrics.get("SSIM_MRI", 0.0) + val_metrics.get("SSIM_CT", 0.0))
+                if validation_score > self.best_metric:
+                    self.best_metric = validation_score
+                    best_full_path, best_generator_path = self.save_best_checkpoint(epoch, validation_score)
+                    best_updated = True
             checkpoint_path = self.save_checkpoint(epoch)
 
             print(
@@ -196,4 +294,7 @@ class GANFusionTrainer:
             if val_metrics:
                 metrics_text = " | ".join(f"{key} {value:.4f}" for key, value in val_metrics.items())
                 print(f"Validation | {metrics_text}")
+            if best_updated:
+                print(f"Best model updated: {best_full_path}")
+                print(f"Best generator updated: {best_generator_path}")
             print(f"Saved checkpoint: {checkpoint_path}")

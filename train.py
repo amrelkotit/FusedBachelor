@@ -20,6 +20,8 @@ def parse_args():
     parser.add_argument("--val-split", type=float, default=0.1)
     parser.add_argument("--num-workers", type=int, default=0, help="Use 0 on Windows unless multiprocessing is configured.")
     parser.add_argument("--max-items", type=int, default=None, help="Optional small subset for quick debugging.")
+    parser.add_argument("--resume", default=None, help="Path to a full GAN checkpoint, for example outputs/gan/checkpoints/gan_epoch_012.pt.")
+    parser.add_argument("--auto-resume", action="store_true", help="Automatically resume from the latest gan_epoch_XXX.pt checkpoint.")
     return parser.parse_args()
 
 
@@ -37,6 +39,8 @@ def main():
         val_split=args.val_split,
         num_workers=args.num_workers,
         max_items=args.max_items,
+        resume=args.resume,
+        auto_resume=args.auto_resume,
     )
     trainer.fit()
 
