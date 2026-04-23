@@ -40,7 +40,16 @@ def gaussian_blur(image, kernel_size=5, sigma=1.0):
         dtype=image.dtype,
     )
     padding = kernel_size // 2
-    return F.conv2d(image, kernel, padding=padding, groups=channels)
+    padded = F.pad(image, (padding, padding, padding, padding), mode="reflect")
+    return F.conv2d(padded, kernel, groups=channels)
+
+
+def local_activity(image, kernel_size=5):
+    """Local variance proxy used for adaptive base/detail fusion."""
+    padding = kernel_size // 2
+    mean = F.avg_pool2d(image, kernel_size=kernel_size, stride=1, padding=padding)
+    mean_sq = F.avg_pool2d(image * image, kernel_size=kernel_size, stride=1, padding=padding)
+    return (mean_sq - mean.pow(2)).clamp_min(0.0)
 
 
 def msfd_decompose(image, levels=3, kernel_size=5, sigma=1.0):
@@ -93,17 +102,26 @@ def histogram_match(source, reference, bins=256):
 
 
 def fuse_low_frequency(mri_low, ct_low, histogram_weight=0.5):
-    """Blend low-frequency structure after matching CT contrast to MRI."""
+    """Blend base layers while favoring the locally more informative modality."""
     matched_ct = histogram_match(ct_low, mri_low)
-    return histogram_weight * mri_low + (1.0 - histogram_weight) * matched_ct
+    mri_activity = local_activity(mri_low)
+    ct_activity = local_activity(matched_ct)
+    mri_weight = (mri_activity + 1e-6) / (mri_activity + ct_activity + 2e-6)
+    adaptive = mri_weight * mri_low + (1.0 - mri_weight) * matched_ct
+    average = histogram_weight * mri_low + (1.0 - histogram_weight) * matched_ct
+    return 0.7 * adaptive + 0.3 * average
 
 
 def fuse_high_frequency(mri_highs, ct_highs):
-    """Keep the sharper detail coefficient at each pixel and scale."""
+    """Soft-select sharp detail coefficients instead of hard max switching."""
     fused_highs = []
     for mri_high, ct_high in zip(mri_highs, ct_highs):
-        use_mri = torch.abs(mri_high) >= torch.abs(ct_high)
-        fused_highs.append(torch.where(use_mri, mri_high, ct_high))
+        mri_strength = torch.abs(mri_high)
+        ct_strength = torch.abs(ct_high)
+        weights = torch.softmax(torch.cat([mri_strength, ct_strength], dim=1) * 8.0, dim=1)
+        mri_weight = weights[:, 0:1]
+        ct_weight = weights[:, 1:2]
+        fused_highs.append(mri_weight * mri_high + ct_weight * ct_high)
     return fused_highs
 
 

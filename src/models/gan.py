@@ -3,6 +3,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def edge_guidance(x):
+    """Fixed edge map, no trainable params, so old checkpoints still load."""
+    gray = x.mean(dim=1, keepdim=True)
+    dx = F.pad(torch.abs(gray[:, :, :, 1:] - gray[:, :, :, :-1]), (0, 1, 0, 0))
+    dy = F.pad(torch.abs(gray[:, :, 1:, :] - gray[:, :, :-1, :]), (0, 0, 0, 1))
+    edge = dx + dy
+    edge = edge / (edge.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6))
+    return edge
+
+
 class MultiScaleConvBlock(nn.Module):
     """Parallel receptive fields help preserve fine and wider anatomical detail."""
 
@@ -23,7 +33,9 @@ class MultiScaleConvBlock(nn.Module):
 
     def forward(self, x):
         x = torch.cat([self.conv3(x), self.conv5(x), self.conv7(x)], dim=1)
-        return self.mix(x)
+        # A small fixed edge gate makes the block more boundary-aware while
+        # preserving checkpoint compatibility because it has no parameters.
+        return self.mix(x) * (1.0 + 0.1 * edge_guidance(x))
 
 
 class DownBlock(nn.Module):
@@ -80,6 +92,22 @@ class FusionGenerator(nn.Module):
         x = self.up2(x, skip2)
         x = self.up1(x, skip1)
         return self.out(x)
+
+    def forward_with_debug(self, ct, mri):
+        """Return final output plus values before/after final activation."""
+        x = torch.cat([ct, mri], dim=1)
+        skip1, x = self.down1(x)
+        skip2, x = self.down2(x)
+        skip3, x = self.down3(x)
+        x = self.bottleneck(x)
+        x = self.up3(x, skip3)
+        x = self.up2(x, skip2)
+        x = self.up1(x, skip1)
+        x = self.out[0](x)
+        x = self.out[1](x)
+        pre_activation = self.out[2](x)
+        post_activation = self.out[3](pre_activation)
+        return post_activation, pre_activation, post_activation
 
 
 class PatchDiscriminator(nn.Module):

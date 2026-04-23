@@ -12,17 +12,45 @@ def sobel_edges(image):
     return torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-8)
 
 
-def gradient_loss(fused, mri, ct):
-    """Preserve the strongest CT/MRI Sobel edge at each pixel."""
-    fused_edges = sobel_edges(fused)
-    target_edges = torch.maximum(sobel_edges(mri), sobel_edges(ct))
-    return F.l1_loss(fused_edges, target_edges)
+def high_frequency(image):
+    """Small Laplacian-style detail map used to discourage over-smoothing."""
+    blurred = F.avg_pool2d(image, kernel_size=3, stride=1, padding=1)
+    return image - blurred
+
+
+def gradient_loss(fused, mri, ct, levels=3):
+    """Preserve strongest CT/MRI Sobel edges at multiple scales.
+
+    Strong boundaries receive slightly higher weight, which helps skull edges,
+    tissue borders, and small bright structures survive the adversarial stage.
+    """
+    loss = fused.new_tensor(0.0)
+    fused_scale = fused
+    mri_scale = mri
+    ct_scale = ct
+
+    for level in range(levels):
+        fused_edges = sobel_edges(fused_scale)
+        target_edges = torch.maximum(sobel_edges(mri_scale), sobel_edges(ct_scale))
+        edge_weight = 1.0 + 2.0 * target_edges.detach()
+        scale_weight = 1.0 / (2 ** level)
+        loss = loss + scale_weight * F.l1_loss(fused_edges * edge_weight, target_edges * edge_weight)
+
+        if level < levels - 1:
+            fused_scale = F.avg_pool2d(fused_scale, kernel_size=2, stride=2, ceil_mode=True)
+            mri_scale = F.avg_pool2d(mri_scale, kernel_size=2, stride=2, ceil_mode=True)
+            ct_scale = F.avg_pool2d(ct_scale, kernel_size=2, stride=2, ceil_mode=True)
+
+    target_detail = torch.maximum(torch.abs(high_frequency(mri)), torch.abs(high_frequency(ct)))
+    detail_loss = F.l1_loss(torch.abs(high_frequency(fused)), target_detail)
+    return loss + 0.25 * detail_loss
 
 
 def intensity_loss(fused, mri, ct):
-    """Preserve bright structures from either source image."""
-    target = torch.maximum(mri, ct)
-    return F.l1_loss(fused, target)
+    """Preserve bright structures and soft tissue from either source image."""
+    strongest = torch.maximum(mri, ct)
+    mean_source = 0.5 * (mri + ct)
+    return 0.7 * F.l1_loss(fused, strongest) + 0.3 * F.l1_loss(fused, mean_source)
 
 
 def ssim_loss(image, reference, data_range=1.0, window_size=7):
@@ -49,7 +77,7 @@ def structural_loss(fused, mri, ct):
     return 0.5 * ssim_loss(fused, mri) + 0.5 * ssim_loss(fused, ct)
 
 
-def fusion_loss(fused, mri, ct, intensity_weight=1.0, structural_weight=0.5):
+def fusion_loss(fused, mri, ct, intensity_weight=1.0, structural_weight=0.75):
     return intensity_weight * intensity_loss(fused, mri, ct) + structural_weight * structural_loss(fused, mri, ct)
 
 
@@ -57,21 +85,24 @@ def gan_generator_loss(fake_logits):
     return F.binary_cross_entropy_with_logits(fake_logits, torch.ones_like(fake_logits))
 
 
-def gan_discriminator_loss(real_logits, fake_logits):
-    real_loss = F.binary_cross_entropy_with_logits(real_logits, torch.ones_like(real_logits))
-    fake_loss = F.binary_cross_entropy_with_logits(fake_logits, torch.zeros_like(fake_logits))
+def gan_discriminator_loss(real_logits, fake_logits, label_smoothing=0.9):
+    """Smoothed real labels reduce discriminator dominance."""
+    real_targets = torch.full_like(real_logits, label_smoothing)
+    fake_targets = torch.zeros_like(fake_logits)
+    real_loss = F.binary_cross_entropy_with_logits(real_logits, real_targets)
+    fake_loss = F.binary_cross_entropy_with_logits(fake_logits, fake_targets)
     return 0.5 * (real_loss + fake_loss)
 
 
 class MedicalFusionGANLoss(nn.Module):
-    """Total G loss = fusion + lambda_gan * GAN + lambda_grad * Sobel gradient.
+    """Total G loss = fusion + lambda_gan * GAN + lambda_grad * edge loss.
 
-    Defaults keep medical content dominant while letting GAN sharpen realism:
-    lambda_gan=0.01 prevents adversarial texture from overpowering anatomy,
-    lambda_grad=5.0 strongly penalizes weak skull/tissue boundaries.
+    Defaults are intentionally conservative for medical fusion:
+    lambda_gan=0.005 lowers adversarial pressure after discriminator dominance,
+    lambda_grad=7.5 gives stronger boundary/detail preservation.
     """
 
-    def __init__(self, lambda_gan=0.01, lambda_grad=5.0, lambda_fusion=1.0):
+    def __init__(self, lambda_gan=0.005, lambda_grad=7.5, lambda_fusion=1.0):
         super().__init__()
         self.lambda_gan = lambda_gan
         self.lambda_grad = lambda_grad
@@ -90,7 +121,7 @@ class MedicalFusionGANLoss(nn.Module):
         }
 
 
-def total_generator_loss(fused, mri, ct, fake_logits=None, fusion_weight=1.0, gan_weight=0.01):
+def total_generator_loss(fused, mri, ct, fake_logits=None, fusion_weight=1.0, gan_weight=0.005):
     base_loss = fusion_loss(fused, mri, ct) + gradient_loss(fused, mri, ct)
     if fake_logits is None:
         gan_loss = fused.new_tensor(0.0)

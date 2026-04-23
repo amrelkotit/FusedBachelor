@@ -1,5 +1,14 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+def edge_guidance(x):
+    gray = x.mean(dim=1, keepdim=True)
+    dx = F.pad(torch.abs(gray[:, :, :, 1:] - gray[:, :, :, :-1]), (0, 1, 0, 0))
+    dy = F.pad(torch.abs(gray[:, :, 1:, :] - gray[:, :, :-1, :]), (0, 0, 0, 1))
+    edge = dx + dy
+    return edge / edge.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
 
 
 class MultiScaleFeatureExtractor(nn.Module):
@@ -23,4 +32,4 @@ class MultiScaleFeatureExtractor(nn.Module):
         combined = torch.cat([f3, f5, f7], dim=1)
         out = self.fusion(combined)
 
-        return out
+        return out * (1.0 + 0.1 * edge_guidance(x))
