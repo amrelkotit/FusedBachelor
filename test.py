@@ -46,9 +46,9 @@ def evaluate_dataset(generator, dataset, device, sample_dir, max_samples):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate GAN fusion on AANLIB/test and BRATS_SPLIT/test.")
-    parser.add_argument("--checkpoint", default="outputs/gan/checkpoints/generator_latest.pt")
+    parser.add_argument("--checkpoint", default="outputs/models/gan/checkpoints/generator_latest.pt")
     parser.add_argument("--test-roots", nargs="+", default=[str(path) for path in DEFAULT_TEST_ROOTS])
-    parser.add_argument("--output-dir", default="outputs/test_results")
+    parser.add_argument("--output-dir", default="outputs/models/gan/test_results")
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--max-samples", type=int, default=8)
     return parser.parse_args()

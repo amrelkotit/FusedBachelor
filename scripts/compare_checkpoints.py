@@ -64,7 +64,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Compare GAN fusion checkpoints numerically and save visual samples.")
     parser.add_argument("--dataset-roots", nargs="+", default=[str(path) for path in DEFAULT_TEST_ROOTS])
     parser.add_argument("--checkpoints", nargs="+", required=True)
-    parser.add_argument("--output-dir", default="outputs/checkpoint_comparison")
+    parser.add_argument("--output-dir", default="outputs/models/gan/checkpoint_comparison")
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-items", type=int, default=64)

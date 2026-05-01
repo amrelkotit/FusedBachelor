@@ -1,6 +1,7 @@
 from pathlib import Path
 import csv
 import json
+import math
 import os
 
 os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
@@ -67,24 +68,59 @@ def _avg_source_metric(metrics, left_key, right_key):
     return 0.5 * (metrics.get(left_key, 0.0) + metrics.get(right_key, 0.0))
 
 
+def resolve_training_device(device, allow_cpu=False):
+    requested = str(device or "auto").strip().lower()
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return "cuda:0"
+        print("[Device] WARNING: CUDA is not available. Training is stopped because CPU fallback is disabled.")
+        print("[Device] Install/use a CUDA-enabled PyTorch build and NVIDIA driver, or pass --allow-cpu to train on CPU.")
+        if allow_cpu:
+            return "cpu"
+        raise RuntimeError("CUDA is not available. Refusing to train on CPU without --allow-cpu.")
+    if requested in {"cuda", "gpu"} or requested.startswith("cuda:"):
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested, but PyTorch cannot access an NVIDIA CUDA GPU.")
+        return "cuda:0" if requested in {"cuda", "gpu"} else requested
+    if requested == "cpu":
+        if not allow_cpu:
+            print("[Device] WARNING: CPU training was requested, but CPU fallback is disabled.")
+            print("[Device] Pass --allow-cpu only if you intentionally want to train without CUDA.")
+            raise RuntimeError("Refusing to train on CPU without --allow-cpu.")
+        return "cpu"
+    raise ValueError(f"Unsupported device: {device}. Use auto, cuda, cuda:0, or cpu.")
+
+
+def describe_training_device(device):
+    if str(device).startswith("cuda"):
+        index = torch.device(device).index
+        if index is None:
+            index = torch.cuda.current_device()
+        return f"{device} ({torch.cuda.get_device_name(index)})"
+    return "cpu"
+
+
 class GANFusionTrainer:
     def __init__(
         self,
         dataset_root=None,
         train_roots=None,
-        output_dir="outputs",
+        output_dir="outputs/models/gan",
         image_size=256,
         batch_size=204,
+        micro_batch=4,
         epochs=50,
         lr=1e-4,
         discriminator_lr_factor=0.5,
         lambda_gan=0.005,
         lambda_grad=7.5,
         val_split=0.1,
+        val_every=1,
         patience=8,
         min_delta=1e-4,
         num_workers=0,
         device=None,
+        allow_cpu=False,
         max_items=None,
         resume=None,
         auto_resume=False,
@@ -114,20 +150,22 @@ class GANFusionTrainer:
         self.min_delta = min_delta
         self.lr_g = lr
         self.lr_d = lr * discriminator_lr_factor
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = resolve_training_device(device, allow_cpu=allow_cpu)
+        if self.device.startswith("cuda"):
+            torch.backends.cudnn.benchmark = True
+        monitor_write(f"[Device] Selected runtime device: {describe_training_device(self.device)}")
         self.history = []
         self.requested_batch_size = batch_size
-        if batch_size == 204:
-            self.micro_batch_size = 4
-            self.accumulation_steps = 51
-        elif batch_size > 4:
-            self.micro_batch_size = 4
-            self.accumulation_steps = (batch_size + self.micro_batch_size - 1) // self.micro_batch_size
-        else:
-            self.micro_batch_size = batch_size
-            self.accumulation_steps = 1
+        if micro_batch < 1:
+            raise ValueError("--micro-batch must be at least 1.")
+        if val_every < 1:
+            raise ValueError("--val-every must be at least 1.")
+        self.micro_batch_size = micro_batch
+        self.accumulation_steps = math.ceil(batch_size / self.micro_batch_size)
         self.effective_batch_size = self.micro_batch_size * self.accumulation_steps
-        self.amp_enabled = self.device == "cuda"
+        self.num_workers = num_workers
+        self.val_every = val_every
+        self.amp_enabled = self.device.startswith("cuda")
         self.scaler = GradScaler(enabled=self.amp_enabled)
         self.max_grad_norm = 1.0
         self.printed_first_batch_stats = False
@@ -159,11 +197,19 @@ class GANFusionTrainer:
             batch_size=self.micro_batch_size,
             shuffle=True,
             num_workers=num_workers,
-            pin_memory=self.device == "cuda",
+            pin_memory=self.device.startswith("cuda"),
+            persistent_workers=num_workers > 0,
         )
         self.val_loader = None
         if val_dataset is not None:
-            self.val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0)
+            self.val_loader = DataLoader(
+                val_dataset,
+                batch_size=1,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=self.device.startswith("cuda"),
+                persistent_workers=num_workers > 0,
+            )
 
         self.generator = FusionGenerator().to(self.device)
         self.discriminator1 = PatchDiscriminator(in_channels=1).to(self.device)
@@ -178,6 +224,8 @@ class GANFusionTrainer:
         monitor_write(f"Micro batch: {self.micro_batch_size}")
         monitor_write(f"Accumulation steps: {self.accumulation_steps}")
         monitor_write(f"Effective batch: {self.effective_batch_size}")
+        monitor_write(f"Num workers: {self.num_workers}")
+        monitor_write(f"Validation interval: every {self.val_every} epoch(s), plus final epoch")
         monitor_write(f"AMP mixed precision: {'enabled' if self.amp_enabled else 'disabled'}")
         monitor_write(f"Generator LR: {self.lr_g:.2e}")
         monitor_write(f"Discriminator LR: {self.lr_d:.2e}")
@@ -202,7 +250,7 @@ class GANFusionTrainer:
 
     def find_latest_checkpoint(self):
         checkpoints = []
-        for folder in [self.checkpoint_dir, Path("outputs") / "gan" / "checkpoints"]:
+        for folder in [self.checkpoint_dir, Path("outputs") / "models" / "gan" / "checkpoints"]:
             if not folder.exists():
                 continue
             for path in folder.glob("gan_epoch_*.pt"):
@@ -412,7 +460,7 @@ class GANFusionTrainer:
                 skip_window = True
                 continue
 
-            with autocast(enabled=False):
+            with autocast(enabled=self.amp_enabled):
                 fused_for_d, pre_d, post_d = self.generator.forward_with_debug(ct.float(), mri.float())
             self.is_finite(pre_d, "generator output before final activation for discriminator", epoch, batch_index)
             self.is_finite(post_d, "generator output after final activation for discriminator", epoch, batch_index)
@@ -420,7 +468,7 @@ class GANFusionTrainer:
             if not fused_d_ok:
                 skip_window = True
                 continue
-            with autocast(enabled=False):
+            with autocast(enabled=self.amp_enabled):
                 d1_loss, d2_loss = self._discriminator_losses(fused_for_d.float(), ct.float(), mri.float())
                 d_loss = (d1_loss + d2_loss) / self.accumulation_steps
             if not self.is_finite(d1_loss, "discriminator1 loss", epoch, batch_index) or not self.is_finite(d2_loss, "discriminator2 loss", epoch, batch_index):
@@ -431,7 +479,7 @@ class GANFusionTrainer:
             self._set_requires_grad(self.discriminator1, False)
             self._set_requires_grad(self.discriminator2, False)
             try:
-                with autocast(enabled=False):
+                with autocast(enabled=self.amp_enabled):
                     fused_for_g, pre_g, post_g = self.generator.forward_with_debug(ct.float(), mri.float())
                 self.is_finite(pre_g, "generator output before final activation for generator", epoch, batch_index)
                 self.is_finite(post_g, "generator output after final activation for generator", epoch, batch_index)
@@ -439,7 +487,7 @@ class GANFusionTrainer:
                 if not fused_g_ok:
                     skip_window = True
                     continue
-                with autocast(enabled=False):
+                with autocast(enabled=self.amp_enabled):
                     g_losses = self._generator_loss_parts(fused_for_g.float(), ct.float(), mri.float())
                     g_loss = g_losses["total"] / self.accumulation_steps
                 if (
@@ -539,14 +587,14 @@ class GANFusionTrainer:
             mri = batch["mri"].to(self.device)
             if not self.is_finite(ct, "validation input ct", epoch, index + 1) or not self.is_finite(mri, "validation input mri", epoch, index + 1):
                 continue
-            with autocast(enabled=False):
+            with autocast(enabled=self.amp_enabled):
                 fused, pre_val, post_val = self.generator.forward_with_debug(ct.float(), mri.float())
             self.is_finite(pre_val, "validation generator output before final activation", epoch, index + 1)
             self.is_finite(post_val, "validation generator output after final activation", epoch, index + 1)
             fused, fused_ok = self.safe_fused(fused, "validation fused output", epoch, index + 1)
             if not fused_ok:
                 continue
-            with autocast(enabled=False):
+            with autocast(enabled=self.amp_enabled):
                 g_losses = self._generator_loss_parts(fused.float(), ct.float(), mri.float())
                 d1_loss, d2_loss = self._discriminator_losses(fused.float(), ct.float(), mri.float())
             if (
@@ -703,13 +751,20 @@ class GANFusionTrainer:
         epochs = [int(row["epoch"]) for row in self.history]
         for train_key, val_key, filename, title, ylabel in graph_specs:
             train_values = [float(row[train_key]) for row in self.history]
-            val_values = [float(row[val_key]) for row in self.history]
+            val_points = [
+                (int(row["epoch"]), float(row[val_key]))
+                for row in self.history
+                if row.get(val_key) is not None
+            ]
             plt.figure(figsize=(9, 5), dpi=160)
             plt.plot(epochs, train_values, label=train_key, linewidth=2)
-            plt.plot(epochs, val_values, label=val_key, linewidth=2)
-            if self.best_epoch is not None and self.best_epoch in epochs:
-                best_index = epochs.index(self.best_epoch)
-                plt.scatter([self.best_epoch], [val_values[best_index]], color="red", zorder=5, label=f"best epoch {self.best_epoch}")
+            if val_points:
+                val_epochs = [epoch for epoch, _ in val_points]
+                val_values = [value for _, value in val_points]
+                plt.plot(val_epochs, val_values, label=val_key, linewidth=2)
+                if self.best_epoch is not None and self.best_epoch in val_epochs:
+                    best_index = val_epochs.index(self.best_epoch)
+                    plt.scatter([self.best_epoch], [val_values[best_index]], color="red", zorder=5, label=f"best epoch {self.best_epoch}")
             plt.title(title)
             plt.xlabel("Epoch")
             plt.ylabel(ylabel)
@@ -720,10 +775,11 @@ class GANFusionTrainer:
             plt.close()
 
     def fitting_analysis(self):
-        if len(self.history) < 3:
-            return "Not enough epochs yet for reliable fitting analysis."
+        validated_history = [row for row in self.history if row.get("val_total_loss") is not None and row.get("val_ssim") is not None]
+        if len(validated_history) < 3:
+            return "Not enough validated epochs yet for reliable fitting analysis."
 
-        recent = self.history[-3:]
+        recent = validated_history[-3:]
         train_losses = [float(row["train_total_loss"]) for row in recent]
         val_losses = [float(row["val_total_loss"]) for row in recent]
         train_ssim = [float(row["train_ssim"]) for row in recent]
@@ -784,8 +840,9 @@ class GANFusionTrainer:
                 f"Checkpoint is already at epoch {self.start_epoch - 1}. "
                 f"Requested total epochs: {self.epochs}. Nothing to train."
             )
-            return
+            return False
 
+        completed_epoch = None
         epoch_bar = tqdm(
             range(self.start_epoch, self.epochs + 1),
             desc="Training epochs",
@@ -794,11 +851,12 @@ class GANFusionTrainer:
         )
         for epoch in epoch_bar:
             train_values = self.train_epoch(epoch)
-            val_values = self.validate(epoch)
-            val_ssim = float(val_values.get("ssim", float("-inf")))
-            val_loss = float(val_values.get("total_loss", float("inf")))
+            should_validate = epoch % self.val_every == 0 or epoch == self.epochs
+            val_values = self.validate(epoch) if should_validate else {}
+            val_ssim = float(val_values.get("ssim", float("-inf"))) if should_validate else None
+            val_loss = float(val_values.get("total_loss", float("inf"))) if should_validate else None
 
-            is_best = self.is_better_epoch(val_ssim, val_loss)
+            is_best = should_validate and self.is_better_epoch(val_ssim, val_loss)
             if is_best:
                 self.best_epoch = epoch
                 self.best_val_ssim = val_ssim
@@ -807,7 +865,8 @@ class GANFusionTrainer:
                 self.no_improve_epochs = 0
                 best_full_path, best_generator_path = self.save_best_checkpoint(epoch)
             else:
-                self.no_improve_epochs += 1
+                if should_validate:
+                    self.no_improve_epochs += 1
                 best_full_path = None
                 best_generator_path = None
 
@@ -816,23 +875,28 @@ class GANFusionTrainer:
             self.append_history(row)
             self.plot_history()
             self.update_reports(row)
+            completed_epoch = epoch
 
             epoch_bar.set_postfix(
                 lr=f"{self.optimizer_g.param_groups[0]['lr']:.2e}",
                 train=f"{train_values['total_loss']:.4f}",
-                val=f"{val_loss:.4f}",
-                ssim=f"{val_ssim:.4f}",
+                val=f"{val_loss:.4f}" if val_loss is not None else "skip",
+                ssim=f"{val_ssim:.4f}" if val_ssim is not None else "skip",
                 best=self.best_epoch,
             )
+            val_loss_text = f"{val_loss:.4f}" if val_loss is not None else "skipped"
+            val_ssim_text = f"{val_ssim:.4f}" if val_ssim is not None else "skipped"
             monitor_write(
                 f"Epoch {epoch:03d}/{self.epochs:03d} | "
                 f"train_loss={train_values['total_loss']:.4f} | "
-                f"val_loss={val_loss:.4f} | val_ssim={val_ssim:.4f} | "
+                f"val_loss={val_loss_text} | val_ssim={val_ssim_text} | "
                 f"best_epoch={self.best_epoch} | checkpoint={checkpoint_path}"
             )
             if is_best:
                 monitor_write(f"Best model updated: {best_full_path}")
                 monitor_write(f"Best generator updated: {best_generator_path}")
-            if self.patience > 0 and self.no_improve_epochs >= self.patience:
+            if should_validate and self.patience > 0 and self.no_improve_epochs >= self.patience:
                 monitor_write(f"Early stopping: no validation SSIM/loss improvement for {self.no_improve_epochs} epochs.")
-                break
+                return False
+
+        return completed_epoch == self.epochs

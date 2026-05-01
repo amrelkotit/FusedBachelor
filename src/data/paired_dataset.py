@@ -9,7 +9,8 @@ from torch.utils.data import ConcatDataset, Dataset
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
 
-FINAL_DATASET_ROOT = Path(r"E:\El Gam3a\My bachelor\Fused bachelor\data\raw\final_dataset")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+FINAL_DATASET_ROOT = PROJECT_ROOT / "data" / "raw" / "final_dataset"
 AANLIB_TRAIN = FINAL_DATASET_ROOT / "AANLIB" / "train"
 AANLIB_TEST = FINAL_DATASET_ROOT / "AANLIB" / "test"
 BRATS_TRAIN = FINAL_DATASET_ROOT / "BRATS" / "train"
