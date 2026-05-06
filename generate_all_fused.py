@@ -13,8 +13,8 @@ from src.models.gan import FusionGenerator
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATASET_ROOT = PROJECT_ROOT / "data" / "raw" / "final_dataset"
-DEFAULT_CHECKPOINT = Path("outputs") / "models" / "gan" / "checkpoints" / "best_generator.pth"
-DEFAULT_OUTPUT_DIR = Path("outputs") / "models" / "gan" / "images"
+DEFAULT_CHECKPOINT = Path("outputs") / "models" / "gan_continued_from_50" / "checkpoints" / "best_generator.pt"
+DEFAULT_OUTPUT_DIR = Path("outputs") / "models" / "gan_continued_from_50" / "images"
 DATASET_SPLITS = (
     ("AANLIB", "train"),
     ("AANLIB", "test"),
@@ -53,7 +53,8 @@ def read_grayscale(path, image_size):
     if image is None:
         raise ValueError(f"Could not read image: {path}")
 
-    image = cv2.resize(image, (image_size, image_size), interpolation=cv2.INTER_CUBIC)
+    interpolation = cv2.INTER_AREA if image.shape[0] > image_size or image.shape[1] > image_size else cv2.INTER_CUBIC
+    image = cv2.resize(image, (image_size, image_size), interpolation=interpolation)
     image = image.astype("float32")
     min_value = image.min()
     max_value = image.max()
@@ -92,7 +93,30 @@ class PairedSplitDataset(Dataset):
 def save_tensor_image(tensor, path):
     path.parent.mkdir(parents=True, exist_ok=True)
     image = tensor.detach().clamp(0.0, 1.0).squeeze().cpu().numpy()
-    ok = cv2.imwrite(str(path), (image * 255.0).astype("uint8"))
+    ok = cv2.imwrite(str(path), (image * 255.0).round().astype("uint8"), [cv2.IMWRITE_PNG_COMPRESSION, 0])
+    if not ok:
+        raise IOError(f"Failed to save image: {path}")
+
+
+def tensor_to_uint8(tensor):
+    image = tensor.detach().clamp(0.0, 1.0).squeeze().cpu().numpy()
+    return (image * 255.0).round().astype("uint8")
+
+
+def enhance_visualization_uint8(image, output_size=512):
+    denoised = cv2.fastNlMeansDenoising(image, None, h=3, templateWindowSize=7, searchWindowSize=21)
+    clahe = cv2.createCLAHE(clipLimit=1.4, tileGridSize=(8, 8))
+    enhanced = clahe.apply(denoised)
+    blurred = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=0.8)
+    enhanced = cv2.addWeighted(enhanced, 1.35, blurred, -0.35, 0)
+    if output_size and enhanced.shape[:2] != (output_size, output_size):
+        enhanced = cv2.resize(enhanced, (output_size, output_size), interpolation=cv2.INTER_CUBIC)
+    return enhanced
+
+
+def save_uint8_image(image, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ok = cv2.imwrite(str(path), image, [cv2.IMWRITE_PNG_COMPRESSION, 0])
     if not ok:
         raise IOError(f"Failed to save image: {path}")
 
@@ -129,7 +153,9 @@ def load_generator(checkpoint_path, device):
 def ensure_output_tree(output_dir):
     output_dir.mkdir(parents=True, exist_ok=True)
     for dataset_name, split_name in DATASET_SPLITS:
-        (output_dir / dataset_name / split_name).mkdir(parents=True, exist_ok=True)
+        (output_dir / "fused_original" / dataset_name / split_name).mkdir(parents=True, exist_ok=True)
+        (output_dir / "fused_enhanced_visualization" / dataset_name / split_name).mkdir(parents=True, exist_ok=True)
+        (output_dir / "comparisons" / dataset_name / split_name).mkdir(parents=True, exist_ok=True)
 
 
 @torch.no_grad()
@@ -137,7 +163,9 @@ def generate_split(generator, dataset_root, output_dir, dataset_name, split_name
     split_root = dataset_root / dataset_name / split_name
     dataset = PairedSplitDataset(split_root, image_size=args.image_size)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
-    split_output_dir = output_dir / dataset_name / split_name
+    original_dir = output_dir / "fused_original" / dataset_name / split_name
+    enhanced_dir = output_dir / "fused_enhanced_visualization" / dataset_name / split_name
+    comparison_dir = output_dir / "comparisons" / dataset_name / split_name
 
     rows = []
     written = 0
@@ -151,14 +179,28 @@ def generate_split(generator, dataset_root, output_dir, dataset_name, split_name
             if args.max_items is not None and written >= args.max_items:
                 return rows
 
-            output_path = split_output_dir / f"{written}_fused.png"
-            save_tensor_image(fused[batch_index], output_path)
+            original_path = original_dir / f"{written}_fused.png"
+            enhanced_path = enhanced_dir / f"{written}_fused_enhanced_512.png"
+            comparison_path = comparison_dir / f"{written}_comparison.png"
+            save_tensor_image(fused[batch_index], original_path)
+            fused_u8 = tensor_to_uint8(fused[batch_index])
+            enhanced_u8 = enhance_visualization_uint8(fused_u8, output_size=args.visualization_size)
+            save_uint8_image(enhanced_u8, enhanced_path)
+
+            if args.save_comparisons:
+                ct_u8 = tensor_to_uint8(batch["ct"][batch_index])
+                mri_u8 = tensor_to_uint8(batch["mri"][batch_index])
+                enhanced_for_panel = cv2.resize(enhanced_u8, (args.image_size, args.image_size), interpolation=cv2.INTER_AREA)
+                panel = cv2.hconcat([ct_u8, mri_u8, fused_u8, enhanced_for_panel])
+                save_uint8_image(panel, comparison_path)
             rows.append(
                 {
                     "dataset": dataset_name,
                     "split": split_name,
                     "index": written,
-                    "output_path": str(output_path.relative_to(PROJECT_ROOT)),
+                    "original_output_path": str(original_path.relative_to(PROJECT_ROOT)),
+                    "enhanced_visualization_path": str(enhanced_path.relative_to(PROJECT_ROOT)),
+                    "comparison_path": str(comparison_path.relative_to(PROJECT_ROOT)) if args.save_comparisons else "",
                     "ct_path": batch["ct_path"][batch_index],
                     "mri_path": batch["mri_path"][batch_index],
                     "checkpoint": str(checkpoint_path.relative_to(PROJECT_ROOT)),
@@ -178,6 +220,8 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-items", type=int, default=None, help="Optional per-split limit for quick checks.")
     parser.add_argument("--device", default="auto", help="auto, cuda, cuda:0, or cpu.")
+    parser.add_argument("--visualization-size", type=int, default=512, help="Enhanced visualization output size; raw model output remains image-size.")
+    parser.add_argument("--save-comparisons", action="store_true", default=True, help="Save CT | MRI | fused | enhanced comparison panels.")
     return parser.parse_args()
 
 
@@ -202,7 +246,17 @@ def main():
 
     manifest_path = output_dir / "generation_manifest.csv"
     with manifest_path.open("w", newline="", encoding="utf-8") as csv_file:
-        fieldnames = ["dataset", "split", "index", "output_path", "ct_path", "mri_path", "checkpoint"]
+        fieldnames = [
+            "dataset",
+            "split",
+            "index",
+            "original_output_path",
+            "enhanced_visualization_path",
+            "comparison_path",
+            "ct_path",
+            "mri_path",
+            "checkpoint",
+        ]
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(manifest_rows)

@@ -56,6 +56,53 @@ def spatial_frequency(image):
     return torch.sqrt(row_freq.pow(2) + col_freq.pow(2)).item()
 
 
+def average_gradient(image):
+    image = _as_bchw(image)
+    dx = image[..., :, 1:] - image[..., :, :-1]
+    dy = image[..., 1:, :] - image[..., :-1, :]
+    dx = F.pad(dx, (0, 1, 0, 0))
+    dy = F.pad(dy, (0, 0, 0, 1))
+    return torch.mean(torch.sqrt((dx.pow(2) + dy.pow(2)) * 0.5 + 1e-8)).item()
+
+
+def mutual_information(image, reference, bins=64):
+    image = _as_bchw(image).detach().flatten().clamp(0.0, 1.0)
+    reference = _as_bchw(reference).to(image.device).detach().flatten().clamp(0.0, 1.0)
+    x = torch.clamp((image * (bins - 1)).long(), 0, bins - 1)
+    y = torch.clamp((reference * (bins - 1)).long(), 0, bins - 1)
+    joint = torch.bincount(x * bins + y, minlength=bins * bins).float().view(bins, bins)
+    joint = joint / joint.sum().clamp_min(1.0)
+    px = joint.sum(dim=1, keepdim=True)
+    py = joint.sum(dim=0, keepdim=True)
+    expected = px @ py
+    mask = joint > 0
+    return (joint[mask] * torch.log2(joint[mask] / expected[mask].clamp_min(1e-12))).sum().item()
+
+
+def edge_preservation_index(fused, mri, ct):
+    fused = _as_bchw(fused)
+    source = torch.maximum(_as_bchw(mri).to(fused.device), _as_bchw(ct).to(fused.device))
+    fused_grad = _gradient_magnitude(fused).flatten()
+    source_grad = _gradient_magnitude(source).flatten()
+    fused_centered = fused_grad - fused_grad.mean()
+    source_centered = source_grad - source_grad.mean()
+    denom = torch.sqrt((fused_centered.pow(2).sum() * source_centered.pow(2).sum()).clamp_min(1e-12))
+    return (fused_centered * source_centered).sum().div(denom).item()
+
+
+def artifact_noise_indicator(image):
+    image = _as_bchw(image)
+    smooth = F.avg_pool2d(image, kernel_size=3, stride=1, padding=1)
+    residual = image - smooth
+    return residual.std().item()
+
+
+def _gradient_magnitude(image):
+    dx = F.pad(image[..., :, 1:] - image[..., :, :-1], (0, 1, 0, 0))
+    dy = F.pad(image[..., 1:, :] - image[..., :-1, :], (0, 0, 0, 1))
+    return torch.sqrt(dx.pow(2) + dy.pow(2) + 1e-8)
+
+
 def multi_scale_ssim(image, reference, levels=3):
     """MS metric: multi-scale SSIM averaged over progressively pooled images."""
     image = _as_bchw(image)
@@ -81,7 +128,12 @@ def evaluate_fusion(fused, mri, ct):
         "PSNR_CT": psnr(fused, ct),
         "SSIM_MRI": ssim(fused, mri),
         "SSIM_CT": ssim(fused, ct),
+        "MI_MRI": mutual_information(fused, mri),
+        "MI_CT": mutual_information(fused, ct),
         "SF": spatial_frequency(fused),
+        "AG": average_gradient(fused),
+        "EPI": edge_preservation_index(fused, mri, ct),
+        "NOISE": artifact_noise_indicator(fused),
         "MS_MRI": multi_scale_ssim(fused, mri),
         "MS_CT": multi_scale_ssim(fused, ct),
     }

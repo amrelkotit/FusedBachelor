@@ -13,6 +13,16 @@ def edge_guidance(x):
     return edge
 
 
+def source_edge_attention(ct, mri):
+    return torch.maximum(edge_guidance(ct), edge_guidance(mri))
+
+
+def apply_source_attention(features, attention, strength=0.15):
+    if attention.shape[-2:] != features.shape[-2:]:
+        attention = F.interpolate(attention, size=features.shape[-2:], mode="bilinear", align_corners=False)
+    return features * (1.0 + strength * attention)
+
+
 class MultiScaleConvBlock(nn.Module):
     """Parallel receptive fields help preserve fine and wider anatomical detail."""
 
@@ -84,25 +94,47 @@ class FusionGenerator(nn.Module):
 
     def forward(self, ct, mri):
         x = torch.cat([ct, mri], dim=1)
+        attention = source_edge_attention(ct, mri)
         skip1, x = self.down1(x)
+        skip1 = apply_source_attention(skip1, attention)
+        x = apply_source_attention(x, attention)
         skip2, x = self.down2(x)
+        skip2 = apply_source_attention(skip2, attention)
+        x = apply_source_attention(x, attention)
         skip3, x = self.down3(x)
+        skip3 = apply_source_attention(skip3, attention)
+        x = apply_source_attention(x, attention)
         x = self.bottleneck(x)
+        x = apply_source_attention(x, attention)
         x = self.up3(x, skip3)
+        x = apply_source_attention(x, attention)
         x = self.up2(x, skip2)
+        x = apply_source_attention(x, attention)
         x = self.up1(x, skip1)
+        x = apply_source_attention(x, attention)
         return self.out(x)
 
     def forward_with_debug(self, ct, mri):
         """Return final output plus values before/after final activation."""
         x = torch.cat([ct, mri], dim=1)
+        attention = source_edge_attention(ct, mri)
         skip1, x = self.down1(x)
+        skip1 = apply_source_attention(skip1, attention)
+        x = apply_source_attention(x, attention)
         skip2, x = self.down2(x)
+        skip2 = apply_source_attention(skip2, attention)
+        x = apply_source_attention(x, attention)
         skip3, x = self.down3(x)
+        skip3 = apply_source_attention(skip3, attention)
+        x = apply_source_attention(x, attention)
         x = self.bottleneck(x)
+        x = apply_source_attention(x, attention)
         x = self.up3(x, skip3)
+        x = apply_source_attention(x, attention)
         x = self.up2(x, skip2)
+        x = apply_source_attention(x, attention)
         x = self.up1(x, skip1)
+        x = apply_source_attention(x, attention)
         x = self.out[0](x)
         x = self.out[1](x)
         pre_activation = self.out[2](x)

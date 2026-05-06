@@ -12,45 +12,68 @@ def sobel_edges(image):
     return torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-8)
 
 
+def gaussian_kernel(image, kernel_size=5, sigma=1.0):
+    coords = torch.arange(kernel_size, device=image.device, dtype=image.dtype)
+    coords = coords - (kernel_size - 1) / 2.0
+    yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+    kernel = torch.exp(-(xx.pow(2) + yy.pow(2)) / (2.0 * sigma * sigma))
+    kernel = kernel / kernel.sum().clamp_min(1e-8)
+    return kernel.view(1, 1, kernel_size, kernel_size).repeat(image.shape[1], 1, 1, 1)
+
+
+def gaussian_blur(image, kernel_size=5, sigma=1.0):
+    padding = kernel_size // 2
+    kernel = gaussian_kernel(image, kernel_size=kernel_size, sigma=sigma)
+    padded = F.pad(image, (padding, padding, padding, padding), mode="reflect")
+    return F.conv2d(padded, kernel, groups=image.shape[1])
+
+
 def high_frequency(image):
-    """Small Laplacian-style detail map used to discourage over-smoothing."""
-    blurred = F.avg_pool2d(image, kernel_size=3, stride=1, padding=1)
-    return image - blurred
+    """Gaussian high-pass residual used only as a supervision signal."""
+    return image - gaussian_blur(image)
 
 
-def gradient_loss(fused, mri, ct, levels=3):
-    """Preserve strongest CT/MRI Sobel edges at multiple scales.
+def foreground_mask(mri, ct, threshold=0.03, dilation=7):
+    mask = ((mri > threshold) | (ct > threshold)).float()
+    if dilation > 1:
+        padding = dilation // 2
+        mask = F.max_pool2d(mask, kernel_size=dilation, stride=1, padding=padding)
+    return mask.clamp(0.0, 1.0)
 
-    Strong boundaries receive slightly higher weight, which helps skull edges,
-    tissue borders, and small bright structures survive the adversarial stage.
-    """
+
+def masked_l1_loss(image, target, mask):
+    mask = mask.to(device=image.device, dtype=image.dtype)
+    denom = mask.sum().clamp_min(1.0)
+    return torch.abs(image - target).mul(mask).sum() / denom
+
+
+def gradient_loss(fused, mri, ct, levels=1):
+    """Preserve strongest CT/MRI Sobel gradients without adding edge maps to output."""
     loss = fused.new_tensor(0.0)
     fused_scale = fused
     mri_scale = mri
     ct_scale = ct
+    mask_scale = foreground_mask(mri, ct)
 
     for level in range(levels):
         fused_edges = sobel_edges(fused_scale)
         target_edges = torch.maximum(sobel_edges(mri_scale), sobel_edges(ct_scale))
-        edge_weight = 1.0 + 2.0 * target_edges.detach()
         scale_weight = 1.0 / (2 ** level)
-        loss = loss + scale_weight * F.l1_loss(fused_edges * edge_weight, target_edges * edge_weight)
+        loss = loss + scale_weight * masked_l1_loss(fused_edges, target_edges, mask_scale)
 
         if level < levels - 1:
             fused_scale = F.avg_pool2d(fused_scale, kernel_size=2, stride=2, ceil_mode=True)
             mri_scale = F.avg_pool2d(mri_scale, kernel_size=2, stride=2, ceil_mode=True)
             ct_scale = F.avg_pool2d(ct_scale, kernel_size=2, stride=2, ceil_mode=True)
+            mask_scale = F.avg_pool2d(mask_scale, kernel_size=2, stride=2, ceil_mode=True)
 
-    target_detail = torch.maximum(torch.abs(high_frequency(mri)), torch.abs(high_frequency(ct)))
-    detail_loss = F.l1_loss(torch.abs(high_frequency(fused)), target_detail)
-    return loss + 0.25 * detail_loss
+    return loss
 
 
 def intensity_loss(fused, mri, ct):
     """Preserve bright structures and soft tissue from either source image."""
-    strongest = torch.maximum(mri, ct)
-    mean_source = 0.5 * (mri + ct)
-    return 0.7 * F.l1_loss(fused, strongest) + 0.3 * F.l1_loss(fused, mean_source)
+    target = torch.maximum(mri, ct)
+    return masked_l1_loss(fused, target, foreground_mask(mri, ct))
 
 
 def ssim_loss(image, reference, data_range=1.0, window_size=7):
@@ -74,55 +97,79 @@ def ssim_loss(image, reference, data_range=1.0, window_size=7):
 
 def structural_loss(fused, mri, ct):
     """Keep structure close to both modalities."""
-    return 0.5 * ssim_loss(fused, mri) + 0.5 * ssim_loss(fused, ct)
+    mask = foreground_mask(mri, ct)
+    return ssim_loss(fused * mask, mri * mask) + ssim_loss(fused * mask, ct * mask)
 
 
-def fusion_loss(fused, mri, ct, intensity_weight=1.0, structural_weight=0.75):
-    return intensity_weight * intensity_loss(fused, mri, ct) + structural_weight * structural_loss(fused, mri, ct)
+def texture_loss(fused, mri, ct):
+    detail_ct = high_frequency(ct)
+    detail_mri = high_frequency(mri)
+    detail_fused = high_frequency(fused)
+    target_detail = torch.where(torch.abs(detail_ct) >= torch.abs(detail_mri), detail_ct, detail_mri)
+    return masked_l1_loss(detail_fused, target_detail, foreground_mask(mri, ct))
+
+
+def fusion_loss(fused, mri, ct):
+    return intensity_loss(fused, mri, ct) + gradient_loss(fused, mri, ct) + structural_loss(fused, mri, ct) + texture_loss(fused, mri, ct)
 
 
 def gan_generator_loss(fake_logits):
-    return F.binary_cross_entropy_with_logits(fake_logits, torch.ones_like(fake_logits))
+    return F.mse_loss(fake_logits, torch.ones_like(fake_logits))
 
 
 def gan_discriminator_loss(real_logits, fake_logits, label_smoothing=0.9):
-    """Smoothed real labels reduce discriminator dominance."""
+    """LSGAN with smoothed real labels reduces discriminator dominance."""
     real_targets = torch.full_like(real_logits, label_smoothing)
     fake_targets = torch.zeros_like(fake_logits)
-    real_loss = F.binary_cross_entropy_with_logits(real_logits, real_targets)
-    fake_loss = F.binary_cross_entropy_with_logits(fake_logits, fake_targets)
+    real_loss = F.mse_loss(real_logits, real_targets)
+    fake_loss = F.mse_loss(fake_logits, fake_targets)
     return 0.5 * (real_loss + fake_loss)
 
 
 class MedicalFusionGANLoss(nn.Module):
-    """Total G loss = fusion + lambda_gan * GAN + lambda_grad * edge loss.
+    """Weighted medical fusion objective with edge/detail terms used only as losses."""
 
-    Defaults are intentionally conservative for medical fusion:
-    lambda_gan=0.005 lowers adversarial pressure after discriminator dominance,
-    lambda_grad=7.5 gives stronger boundary/detail preservation.
-    """
-
-    def __init__(self, lambda_gan=0.005, lambda_grad=7.5, lambda_fusion=1.0):
+    def __init__(
+        self,
+        lambda_intensity=1.0,
+        lambda_gradient=5.0,
+        lambda_ssim=2.0,
+        lambda_texture=3.0,
+        lambda_gan=0.1,
+    ):
         super().__init__()
+        self.lambda_intensity = lambda_intensity
+        self.lambda_gradient = lambda_gradient
+        self.lambda_ssim = lambda_ssim
+        self.lambda_texture = lambda_texture
         self.lambda_gan = lambda_gan
-        self.lambda_grad = lambda_grad
-        self.lambda_fusion = lambda_fusion
 
     def forward(self, fused, mri, ct, d1_fake_logits, d2_fake_logits):
-        fusion = fusion_loss(fused, mri, ct)
+        intensity = intensity_loss(fused, mri, ct)
         grad = gradient_loss(fused, mri, ct)
+        ssim = structural_loss(fused, mri, ct)
+        texture = texture_loss(fused, mri, ct)
         gan = gan_generator_loss(d1_fake_logits) + gan_generator_loss(d2_fake_logits)
-        total = self.lambda_fusion * fusion + self.lambda_gan * gan + self.lambda_grad * grad
+        total = (
+            self.lambda_intensity * intensity
+            + self.lambda_gradient * grad
+            + self.lambda_ssim * ssim
+            + self.lambda_texture * texture
+            + self.lambda_gan * gan
+        )
         return {
             "total": total,
-            "fusion": fusion.detach(),
+            "fusion": (intensity + grad + ssim + texture).detach(),
+            "intensity": intensity.detach(),
             "gradient": grad.detach(),
+            "ssim": ssim.detach(),
+            "texture": texture.detach(),
             "gan": gan.detach(),
         }
 
 
-def total_generator_loss(fused, mri, ct, fake_logits=None, fusion_weight=1.0, gan_weight=0.005):
-    base_loss = fusion_loss(fused, mri, ct) + gradient_loss(fused, mri, ct)
+def total_generator_loss(fused, mri, ct, fake_logits=None, fusion_weight=1.0, gan_weight=0.1):
+    base_loss = fusion_loss(fused, mri, ct)
     if fake_logits is None:
         gan_loss = fused.new_tensor(0.0)
     else:

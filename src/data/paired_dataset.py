@@ -37,7 +37,8 @@ def _read_grayscale(path, image_size):
     if image is None:
         raise ValueError(f"Could not read image: {path}")
 
-    image = cv2.resize(image, image_size, interpolation=cv2.INTER_CUBIC)
+    interpolation = cv2.INTER_AREA if image.shape[0] > image_size[1] or image.shape[1] > image_size[0] else cv2.INTER_CUBIC
+    image = cv2.resize(image, image_size, interpolation=interpolation)
     image = image.astype("float32")
     min_value = image.min()
     max_value = image.max()

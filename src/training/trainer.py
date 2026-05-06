@@ -8,6 +8,7 @@ os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
 
 import cv2
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -20,7 +21,10 @@ from src.data.paired_dataset import CombinedMedicalFusionDataset, DEFAULT_TRAIN_
 from src.evaluation.metrics import evaluate_fusion
 from src.fusion.decomposition import multiscale_fuse
 from src.models.gan import FusionGenerator, PatchDiscriminator
-from src.training.losses import MedicalFusionGANLoss, gan_discriminator_loss
+from src.training.losses import MedicalFusionGANLoss, gan_discriminator_loss, sobel_edges
+
+
+OLD_GAN_CHECKPOINT_DIR = Path("outputs") / "models" / "gan" / "checkpoints"
 
 
 HISTORY_FIELDS = [
@@ -30,8 +34,14 @@ HISTORY_FIELDS = [
     "val_total_loss",
     "train_fusion_loss",
     "val_fusion_loss",
+    "train_intensity_loss",
+    "val_intensity_loss",
     "train_gradient_loss",
     "val_gradient_loss",
+    "train_ssim_loss",
+    "val_ssim_loss",
+    "train_texture_loss",
+    "val_texture_loss",
     "train_gan_loss",
     "val_gan_loss",
     "train_d1_loss",
@@ -44,6 +54,14 @@ HISTORY_FIELDS = [
     "val_ssim",
     "train_sf",
     "val_sf",
+    "train_mi",
+    "val_mi",
+    "train_ag",
+    "val_ag",
+    "train_epi",
+    "val_epi",
+    "train_noise",
+    "val_noise",
     "train_ms",
     "val_ms",
     "best_epoch",
@@ -61,7 +79,72 @@ def _save_tensor_image(tensor, path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     image = tensor.detach().clamp(0.0, 1.0).squeeze().cpu().numpy()
-    cv2.imwrite(str(path), (image * 255.0).astype("uint8"))
+    ok = cv2.imwrite(str(path), (image * 255.0).round().astype("uint8"), [cv2.IMWRITE_PNG_COMPRESSION, 0])
+    if not ok:
+        raise IOError(f"Failed to save image: {path}")
+
+
+def _tensor_to_uint8(tensor):
+    image = tensor.detach().clamp(0.0, 1.0).squeeze().cpu().numpy()
+    return (image * 255.0).round().astype("uint8")
+
+
+def _map_to_uint8(tensor):
+    image = tensor.detach().squeeze().cpu().numpy()
+    image = image - image.min()
+    denom = image.max()
+    if denom > 1e-8:
+        image = image / denom
+    return (image * 255.0).round().astype("uint8")
+
+
+def _enhance_visualization_uint8(image, output_size=512):
+    denoised = cv2.fastNlMeansDenoising(image, None, h=3, templateWindowSize=7, searchWindowSize=21)
+    clahe = cv2.createCLAHE(clipLimit=1.4, tileGridSize=(8, 8))
+    enhanced = clahe.apply(denoised)
+    blurred = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=0.8)
+    enhanced = cv2.addWeighted(enhanced, 1.35, blurred, -0.35, 0)
+    if output_size and enhanced.shape[:2] != (output_size, output_size):
+        enhanced = cv2.resize(enhanced, (output_size, output_size), interpolation=cv2.INTER_CUBIC)
+    return enhanced
+
+
+def _save_validation_comparison(ct, mri, fused, output_path):
+    ct_u8 = _tensor_to_uint8(ct)
+    mri_u8 = _tensor_to_uint8(mri)
+    fused_u8 = _tensor_to_uint8(fused)
+    enhanced_u8 = _enhance_visualization_uint8(fused_u8, output_size=fused_u8.shape[0])
+    comparison = np.concatenate([ct_u8, mri_u8, fused_u8, enhanced_u8], axis=1)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ok = cv2.imwrite(str(output_path), comparison, [cv2.IMWRITE_PNG_COMPRESSION, 0])
+    if not ok:
+        raise IOError(f"Failed to save comparison image: {output_path}")
+
+
+def _save_edge_diagnostic(ct, mri, fused, output_path):
+    ct_edge = sobel_edges(ct.unsqueeze(0)).squeeze(0)
+    mri_edge = sobel_edges(mri.unsqueeze(0)).squeeze(0)
+    fused_edge = sobel_edges(fused.unsqueeze(0)).squeeze(0)
+    target_edge = torch.maximum(ct_edge, mri_edge)
+    edge_error = torch.abs(fused_edge - target_edge)
+    panel = np.concatenate(
+        [
+            _tensor_to_uint8(ct),
+            _tensor_to_uint8(mri),
+            _tensor_to_uint8(fused),
+            _map_to_uint8(ct_edge),
+            _map_to_uint8(mri_edge),
+            _map_to_uint8(fused_edge),
+            _map_to_uint8(edge_error),
+        ],
+        axis=1,
+    )
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ok = cv2.imwrite(str(output_path), panel, [cv2.IMWRITE_PNG_COMPRESSION, 0])
+    if not ok:
+        raise IOError(f"Failed to save edge diagnostic image: {output_path}")
 
 
 def _avg_source_metric(metrics, left_key, right_key):
@@ -111,9 +194,13 @@ class GANFusionTrainer:
         micro_batch=4,
         epochs=50,
         lr=1e-4,
-        discriminator_lr_factor=0.5,
-        lambda_gan=0.005,
-        lambda_grad=7.5,
+        discriminator_lr_factor=0.25,
+        discriminator_update_interval=2,
+        lambda_intensity=1.0,
+        lambda_gradient=5.0,
+        lambda_ssim=2.0,
+        lambda_texture=3.0,
+        lambda_gan=0.1,
         val_split=0.1,
         val_every=1,
         patience=8,
@@ -130,7 +217,11 @@ class GANFusionTrainer:
         self.output_dir = Path(output_dir)
         self.checkpoint_dir = self.output_dir / "checkpoints"
         self.sample_dir = self.output_dir / "samples"
-        self.history_dir = self.output_dir / "history"
+        self.original_sample_dir = self.sample_dir / "fused_original"
+        self.enhanced_sample_dir = self.sample_dir / "fused_enhanced_visualization"
+        self.comparison_sample_dir = self.sample_dir / "comparisons"
+        self.edge_diagnostic_dir = self.sample_dir / "edge_diagnostics"
+        self.history_dir = self.output_dir / "logs"
         self.graph_dir = self.output_dir / "graphs"
         self.report_dir = self.output_dir / "training_reports"
         self.history_csv_path = self.history_dir / "training_history.csv"
@@ -150,6 +241,7 @@ class GANFusionTrainer:
         self.min_delta = min_delta
         self.lr_g = lr
         self.lr_d = lr * discriminator_lr_factor
+        self.discriminator_update_interval = discriminator_update_interval
         self.device = resolve_training_device(device, allow_cpu=allow_cpu)
         if self.device.startswith("cuda"):
             torch.backends.cudnn.benchmark = True
@@ -192,30 +284,42 @@ class GANFusionTrainer:
         else:
             train_dataset, val_dataset = dataset, None
 
+        loader_kwargs = {
+            "num_workers": num_workers,
+            "pin_memory": self.device.startswith("cuda"),
+        }
+
+        if num_workers > 0:
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["prefetch_factor"] = 2
+
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=self.micro_batch_size,
             shuffle=True,
-            num_workers=num_workers,
-            pin_memory=self.device.startswith("cuda"),
-            persistent_workers=num_workers > 0,
+            **loader_kwargs,
         )
+
         self.val_loader = None
         if val_dataset is not None:
             self.val_loader = DataLoader(
                 val_dataset,
                 batch_size=1,
                 shuffle=False,
-                num_workers=num_workers,
-                pin_memory=self.device.startswith("cuda"),
-                persistent_workers=num_workers > 0,
-            )
+                **loader_kwargs,
+        )
 
         self.generator = FusionGenerator().to(self.device)
         self.discriminator1 = PatchDiscriminator(in_channels=1).to(self.device)
         self.discriminator2 = PatchDiscriminator(in_channels=1).to(self.device)
 
-        self.generator_loss = MedicalFusionGANLoss(lambda_gan=lambda_gan, lambda_grad=lambda_grad)
+        self.generator_loss = MedicalFusionGANLoss(
+            lambda_intensity=lambda_intensity,
+            lambda_gradient=lambda_gradient,
+            lambda_ssim=lambda_ssim,
+            lambda_texture=lambda_texture,
+            lambda_gan=lambda_gan,
+        )
         self.optimizer_g = torch.optim.Adam(self.generator.parameters(), lr=self.lr_g, betas=(0.5, 0.999))
         self.optimizer_d1 = torch.optim.Adam(self.discriminator1.parameters(), lr=self.lr_d, betas=(0.5, 0.999))
         self.optimizer_d2 = torch.optim.Adam(self.discriminator2.parameters(), lr=self.lr_d, betas=(0.5, 0.999))
@@ -229,6 +333,7 @@ class GANFusionTrainer:
         monitor_write(f"AMP mixed precision: {'enabled' if self.amp_enabled else 'disabled'}")
         monitor_write(f"Generator LR: {self.lr_g:.2e}")
         monitor_write(f"Discriminator LR: {self.lr_d:.2e}")
+        monitor_write(f"Discriminator update interval: every {self.discriminator_update_interval} batch(es)")
 
         self.load_history()
         self.restore_best_from_history()
@@ -245,12 +350,22 @@ class GANFusionTrainer:
                 self.load_checkpoint(latest_checkpoint)
 
     def _ensure_output_dirs(self):
-        for folder in [self.checkpoint_dir, self.sample_dir, self.history_dir, self.graph_dir, self.report_dir]:
+        for folder in [
+            self.checkpoint_dir,
+            self.sample_dir,
+            self.original_sample_dir,
+            self.enhanced_sample_dir,
+            self.comparison_sample_dir,
+            self.edge_diagnostic_dir,
+            self.history_dir,
+            self.graph_dir,
+            self.report_dir,
+        ]:
             folder.mkdir(parents=True, exist_ok=True)
 
     def find_latest_checkpoint(self):
         checkpoints = []
-        for folder in [self.checkpoint_dir, Path("outputs") / "models" / "gan" / "checkpoints"]:
+        for folder in [self.checkpoint_dir, OLD_GAN_CHECKPOINT_DIR]:
             if not folder.exists():
                 continue
             for path in folder.glob("gan_epoch_*.pt"):
@@ -260,6 +375,9 @@ class GANFusionTrainer:
                     continue
                 checkpoints.append((epoch, path))
         if not checkpoints:
+            old_latest = OLD_GAN_CHECKPOINT_DIR / "latest_checkpoint.pt"
+            if old_latest.exists():
+                return old_latest
             return None
         return max(checkpoints, key=lambda item: item[0])[1]
 
@@ -280,7 +398,8 @@ class GANFusionTrainer:
         ]
         missing_keys = [key for key in required_keys if key not in checkpoint]
         if missing_keys:
-            raise KeyError(f"Checkpoint is missing keys: {missing_keys}")
+            self.load_generator_only_checkpoint(checkpoint, checkpoint_path, missing_keys)
+            return
 
         self.generator.load_state_dict(checkpoint["generator"])
         self.discriminator1.load_state_dict(checkpoint["discriminator1"])
@@ -298,8 +417,29 @@ class GANFusionTrainer:
 
         saved_epoch = int(checkpoint["epoch"])
         self.start_epoch = saved_epoch + 1
-        monitor_write(f"Loaded checkpoint: {checkpoint_path}")
-        monitor_write(f"Resuming from epoch {self.start_epoch}")
+        monitor_write(f"Loaded old checkpoint from {checkpoint_path} and resumed from epoch {self.start_epoch}")
+
+    def load_generator_only_checkpoint(self, checkpoint, checkpoint_path, missing_keys):
+        if not isinstance(checkpoint, dict):
+            state_dict = checkpoint
+        else:
+            for key in ("generator", "generator_state_dict", "model_state_dict", "state_dict"):
+                if key in checkpoint:
+                    state_dict = checkpoint[key]
+                    break
+            else:
+                state_dict = checkpoint
+
+        try:
+            self.generator.load_state_dict(state_dict, strict=True)
+        except RuntimeError as error:
+            raise KeyError(
+                f"Checkpoint is missing full training state keys {missing_keys} and cannot be loaded as generator weights: {error}"
+            ) from error
+
+        self.start_epoch = 51
+        monitor_write(f"Loaded old checkpoint from {checkpoint_path} and resumed from epoch {self.start_epoch}")
+        monitor_write("Loaded generator weights only; optimizer restarted.")
 
     @staticmethod
     def _set_optimizer_lr(optimizer, lr):
@@ -351,7 +491,10 @@ class GANFusionTrainer:
         monitor_write(self.tensor_stats("fused", fused.detach()))
         monitor_write(self.tensor_stats("generator_total_loss", g_losses["total"].detach()))
         monitor_write(self.tensor_stats("fusion_loss", g_losses["fusion"].detach()))
+        monitor_write(self.tensor_stats("intensity_loss", g_losses["intensity"].detach()))
         monitor_write(self.tensor_stats("gradient_loss", g_losses["gradient"].detach()))
+        monitor_write(self.tensor_stats("ssim_loss", g_losses["ssim"].detach()))
+        monitor_write(self.tensor_stats("texture_loss", g_losses["texture"].detach()))
         monitor_write(self.tensor_stats("gan_loss", g_losses["gan"].detach()))
         monitor_write(self.tensor_stats("d1_loss", d1_loss.detach()))
         monitor_write(self.tensor_stats("d2_loss", d2_loss.detach()))
@@ -421,6 +564,10 @@ class GANFusionTrainer:
             "psnr": _avg_source_metric(metrics, "PSNR_MRI", "PSNR_CT"),
             "ssim": _avg_source_metric(metrics, "SSIM_MRI", "SSIM_CT"),
             "sf": metrics.get("SF", 0.0),
+            "mi": _avg_source_metric(metrics, "MI_MRI", "MI_CT"),
+            "ag": metrics.get("AG", 0.0),
+            "epi": metrics.get("EPI", 0.0),
+            "noise": metrics.get("NOISE", 0.0),
             "ms": _avg_source_metric(metrics, "MS_MRI", "MS_CT"),
         }
 
@@ -432,13 +579,20 @@ class GANFusionTrainer:
         totals = {
             "total_loss": 0.0,
             "fusion_loss": 0.0,
+            "intensity_loss": 0.0,
             "gradient_loss": 0.0,
+            "ssim_loss": 0.0,
+            "texture_loss": 0.0,
             "gan_loss": 0.0,
             "d1_loss": 0.0,
             "d2_loss": 0.0,
             "psnr": 0.0,
             "ssim": 0.0,
             "sf": 0.0,
+            "mi": 0.0,
+            "ag": 0.0,
+            "epi": 0.0,
+            "noise": 0.0,
             "ms": 0.0,
         }
         running_loss = 0.0
@@ -468,13 +622,18 @@ class GANFusionTrainer:
             if not fused_d_ok:
                 skip_window = True
                 continue
-            with autocast(enabled=self.amp_enabled):
-                d1_loss, d2_loss = self._discriminator_losses(fused_for_d.float(), ct.float(), mri.float())
-                d_loss = (d1_loss + d2_loss) / self.accumulation_steps
-            if not self.is_finite(d1_loss, "discriminator1 loss", epoch, batch_index) or not self.is_finite(d2_loss, "discriminator2 loss", epoch, batch_index):
-                skip_window = True
-                continue
-            self.scaler.scale(d_loss).backward()
+            should_update_d = batch_index == 1 or batch_index % self.discriminator_update_interval == 0
+            if should_update_d:
+                with autocast(enabled=self.amp_enabled):
+                    d1_loss, d2_loss = self._discriminator_losses(fused_for_d.float(), ct.float(), mri.float())
+                    d_loss = (d1_loss + d2_loss) / self.accumulation_steps
+                if not self.is_finite(d1_loss, "discriminator1 loss", epoch, batch_index) or not self.is_finite(d2_loss, "discriminator2 loss", epoch, batch_index):
+                    skip_window = True
+                    continue
+                self.scaler.scale(d_loss).backward()
+            else:
+                d1_loss = fused_for_d.new_tensor(0.0)
+                d2_loss = fused_for_d.new_tensor(0.0)
 
             self._set_requires_grad(self.discriminator1, False)
             self._set_requires_grad(self.discriminator2, False)
@@ -493,7 +652,10 @@ class GANFusionTrainer:
                 if (
                     not self.is_finite(g_losses["total"], "generator total loss", epoch, batch_index)
                     or not self.is_finite(g_losses["fusion"], "fusion loss", epoch, batch_index)
+                    or not self.is_finite(g_losses["intensity"], "intensity loss", epoch, batch_index)
                     or not self.is_finite(g_losses["gradient"], "gradient loss", epoch, batch_index)
+                    or not self.is_finite(g_losses["ssim"], "ssim loss", epoch, batch_index)
+                    or not self.is_finite(g_losses["texture"], "texture loss", epoch, batch_index)
                     or not self.is_finite(g_losses["gan"], "gan loss", epoch, batch_index)
                 ):
                     skip_window = True
@@ -537,7 +699,10 @@ class GANFusionTrainer:
             running_loss += loss_value
             totals["total_loss"] += loss_value
             totals["fusion_loss"] += g_losses["fusion"].item()
+            totals["intensity_loss"] += g_losses["intensity"].item()
             totals["gradient_loss"] += g_losses["gradient"].item()
+            totals["ssim_loss"] += g_losses["ssim"].item()
+            totals["texture_loss"] += g_losses["texture"].item()
             totals["gan_loss"] += g_losses["gan"].item()
             totals["d1_loss"] += d1_loss.item()
             totals["d2_loss"] += d2_loss.item()
@@ -565,13 +730,20 @@ class GANFusionTrainer:
         totals = {
             "total_loss": 0.0,
             "fusion_loss": 0.0,
+            "intensity_loss": 0.0,
             "gradient_loss": 0.0,
+            "ssim_loss": 0.0,
+            "texture_loss": 0.0,
             "gan_loss": 0.0,
             "d1_loss": 0.0,
             "d2_loss": 0.0,
             "psnr": 0.0,
             "ssim": 0.0,
             "sf": 0.0,
+            "mi": 0.0,
+            "ag": 0.0,
+            "epi": 0.0,
+            "noise": 0.0,
             "ms": 0.0,
         }
 
@@ -607,7 +779,10 @@ class GANFusionTrainer:
 
             totals["total_loss"] += g_losses["total"].item()
             totals["fusion_loss"] += g_losses["fusion"].item()
+            totals["intensity_loss"] += g_losses["intensity"].item()
             totals["gradient_loss"] += g_losses["gradient"].item()
+            totals["ssim_loss"] += g_losses["ssim"].item()
+            totals["texture_loss"] += g_losses["texture"].item()
             totals["gan_loss"] += g_losses["gan"].item()
             totals["d1_loss"] += d1_loss.item()
             totals["d2_loss"] += d2_loss.item()
@@ -615,7 +790,17 @@ class GANFusionTrainer:
                 totals[key] += value
 
             if index < 4:
-                _save_tensor_image(fused[0], self.sample_dir / f"epoch_{epoch:03d}_sample_{index + 1:02d}.png")
+                original_path = self.original_sample_dir / f"epoch_{epoch:03d}_sample_{index + 1:02d}.png"
+                enhanced_path = self.enhanced_sample_dir / f"epoch_{epoch:03d}_sample_{index + 1:02d}.png"
+                comparison_path = self.comparison_sample_dir / f"epoch_{epoch:03d}_sample_{index + 1:02d}_ct_mri_fused_enhanced.png"
+                edge_path = self.edge_diagnostic_dir / f"epoch_{epoch:03d}_sample_{index + 1:02d}_edge_diagnostic.png"
+                _save_tensor_image(fused[0], original_path)
+                enhanced = _enhance_visualization_uint8(_tensor_to_uint8(fused[0]))
+                ok = cv2.imwrite(str(enhanced_path), enhanced, [cv2.IMWRITE_PNG_COMPRESSION, 0])
+                if not ok:
+                    raise IOError(f"Failed to save image: {enhanced_path}")
+                _save_validation_comparison(ct[0], mri[0], fused[0], comparison_path)
+                _save_edge_diagnostic(ct[0], mri[0], fused[0], edge_path)
 
             bar.set_postfix(loss=f"{totals['total_loss'] / (index + 1):.4f}")
 
@@ -701,8 +886,14 @@ class GANFusionTrainer:
             "val_total_loss": val_values.get("total_loss"),
             "train_fusion_loss": train_values.get("fusion_loss"),
             "val_fusion_loss": val_values.get("fusion_loss"),
+            "train_intensity_loss": train_values.get("intensity_loss"),
+            "val_intensity_loss": val_values.get("intensity_loss"),
             "train_gradient_loss": train_values.get("gradient_loss"),
             "val_gradient_loss": val_values.get("gradient_loss"),
+            "train_ssim_loss": train_values.get("ssim_loss"),
+            "val_ssim_loss": val_values.get("ssim_loss"),
+            "train_texture_loss": train_values.get("texture_loss"),
+            "val_texture_loss": val_values.get("texture_loss"),
             "train_gan_loss": train_values.get("gan_loss"),
             "val_gan_loss": val_values.get("gan_loss"),
             "train_d1_loss": train_values.get("d1_loss"),
@@ -715,6 +906,14 @@ class GANFusionTrainer:
             "val_ssim": val_values.get("ssim"),
             "train_sf": train_values.get("sf"),
             "val_sf": val_values.get("sf"),
+            "train_mi": train_values.get("mi"),
+            "val_mi": val_values.get("mi"),
+            "train_ag": train_values.get("ag"),
+            "val_ag": val_values.get("ag"),
+            "train_epi": train_values.get("epi"),
+            "val_epi": val_values.get("epi"),
+            "train_noise": train_values.get("noise"),
+            "val_noise": val_values.get("noise"),
             "train_ms": train_values.get("ms"),
             "val_ms": val_values.get("ms"),
             "best_epoch": self.best_epoch,
@@ -746,6 +945,10 @@ class GANFusionTrainer:
             ("train_ssim", "val_ssim", "train_ssim_vs_val_ssim.png", "Train SSIM vs Validation SSIM", "SSIM"),
             ("train_psnr", "val_psnr", "train_psnr_vs_val_psnr.png", "Train PSNR vs Validation PSNR", "PSNR"),
             ("train_sf", "val_sf", "train_sf_vs_val_sf.png", "Train SF vs Validation SF", "Spatial Frequency"),
+            ("train_mi", "val_mi", "train_mi_vs_val_mi.png", "Train MI vs Validation MI", "Mutual Information"),
+            ("train_ag", "val_ag", "train_ag_vs_val_ag.png", "Train AG vs Validation AG", "Average Gradient"),
+            ("train_epi", "val_epi", "train_epi_vs_val_epi.png", "Train EPI vs Validation EPI", "Edge Preservation"),
+            ("train_noise", "val_noise", "train_noise_vs_val_noise.png", "Train Noise vs Validation Noise", "Noise Indicator"),
             ("train_ms", "val_ms", "train_ms_vs_val_ms.png", "Train MS vs Validation MS", "MS"),
         ]
         epochs = [int(row["epoch"]) for row in self.history]

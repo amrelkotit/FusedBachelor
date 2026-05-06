@@ -20,7 +20,8 @@ def resize_image(img, size=(256, 256)):
     """
     Resize image to fixed size
     """
-    resized = cv2.resize(img, size, interpolation=cv2.INTER_CUBIC)
+    interpolation = cv2.INTER_AREA if img.shape[0] > size[1] or img.shape[1] > size[0] else cv2.INTER_CUBIC
+    resized = cv2.resize(img, size, interpolation=interpolation)
     print(f"[Preprocess] Resized: {resized.shape}")
     return resized
 

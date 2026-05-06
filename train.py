@@ -22,7 +22,7 @@ def parse_args():
         default=[str(path) for path in DEFAULT_TRAIN_ROOTS],
         help="Training split roots. Defaults to AANLIB/train and BRATS_SPLIT/train.",
     )
-    parser.add_argument("--output-dir", default="outputs/models/gan", help="Folder for GAN checkpoints, history, graphs, reports, and samples.")
+    parser.add_argument("--output-dir", default="outputs/models/gan_continued_from_50", help="Folder for GAN checkpoints, logs, graphs, reports, and samples.")
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=204)
     parser.add_argument("--micro-batch", type=int, default=4, help="Mini-batch loaded on the GPU before gradient accumulation.")
@@ -30,9 +30,14 @@ def parse_args():
     parser.add_argument("--device", default="auto", help="Training device: auto, cuda, cuda:0, or cpu. Auto uses cuda:0 when available.")
     parser.add_argument("--allow-cpu", action="store_true", help="Allow training on CPU if CUDA is not available.")
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--discriminator-lr-factor", type=float, default=0.5, help="D learning rate = lr * factor; lower values reduce discriminator dominance.")
-    parser.add_argument("--lambda-gan", type=float, default=0.005)
-    parser.add_argument("--lambda-grad", type=float, default=7.5)
+    parser.add_argument("--discriminator-lr-factor", type=float, default=0.25, help="D learning rate = lr * factor; lower values reduce discriminator dominance.")
+    parser.add_argument("--discriminator-update-interval", type=int, default=2, help="Update D every N batches to reduce noisy adversarial pressure.")
+    parser.add_argument("--lambda-intensity", type=float, default=1.0)
+    parser.add_argument("--lambda-gradient", type=float, default=5.0)
+    parser.add_argument("--lambda-ssim", type=float, default=2.0)
+    parser.add_argument("--lambda-texture", type=float, default=3.0)
+    parser.add_argument("--lambda-gan", type=float, default=0.1)
+    parser.add_argument("--lambda-grad", type=float, default=None, help="Deprecated alias for --lambda-gradient.")
     parser.add_argument("--val-split", type=float, default=0.1)
     parser.add_argument("--val-every", type=int, default=1, help="Validate every N epochs, plus always on the final epoch.")
     parser.add_argument("--patience", type=int, default=8, help="Stop after this many epochs without combined validation improvement. Use 0 to disable.")
@@ -67,8 +72,12 @@ def main():
         allow_cpu=args.allow_cpu,
         lr=args.lr,
         discriminator_lr_factor=args.discriminator_lr_factor,
+        discriminator_update_interval=args.discriminator_update_interval,
+        lambda_intensity=args.lambda_intensity,
+        lambda_gradient=args.lambda_gradient if args.lambda_grad is None else args.lambda_grad,
+        lambda_ssim=args.lambda_ssim,
+        lambda_texture=args.lambda_texture,
         lambda_gan=args.lambda_gan,
-        lambda_grad=args.lambda_grad,
         val_split=args.val_split,
         val_every=args.val_every,
         patience=args.patience,
