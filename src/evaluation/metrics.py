@@ -79,6 +79,24 @@ def mutual_information(image, reference, bins=64):
     return (joint[mask] * torch.log2(joint[mask] / expected[mask].clamp_min(1e-12))).sum().item()
 
 
+def entropy(image, bins=256):
+    image = _as_bchw(image).detach().flatten().clamp(0.0, 1.0)
+    indices = torch.clamp((image * (bins - 1)).long(), 0, bins - 1)
+    hist = torch.bincount(indices, minlength=bins).float()
+    probs = hist / hist.sum().clamp_min(1.0)
+    probs = probs[probs > 0]
+    return -(probs * torch.log2(probs)).sum().item()
+
+
+def correlation_coefficient(image, reference):
+    image = _as_bchw(image).detach().flatten()
+    reference = _as_bchw(reference).to(image.device).detach().flatten()
+    image = image - image.mean()
+    reference = reference - reference.mean()
+    denom = torch.sqrt((image.pow(2).sum() * reference.pow(2).sum()).clamp_min(1e-12))
+    return (image * reference).sum().div(denom).item()
+
+
 def edge_preservation_index(fused, mri, ct):
     fused = _as_bchw(fused)
     source = torch.maximum(_as_bchw(mri).to(fused.device), _as_bchw(ct).to(fused.device))
@@ -88,6 +106,16 @@ def edge_preservation_index(fused, mri, ct):
     source_centered = source_grad - source_grad.mean()
     denom = torch.sqrt((fused_centered.pow(2).sum() * source_centered.pow(2).sum()).clamp_min(1e-12))
     return (fused_centered * source_centered).sum().div(denom).item()
+
+
+def feature_mutual_information(fused, source1, source2):
+    fused_grad = _gradient_magnitude(_as_bchw(fused))
+    source1_grad = _gradient_magnitude(_as_bchw(source1).to(fused_grad.device))
+    source2_grad = _gradient_magnitude(_as_bchw(source2).to(fused_grad.device))
+    return 0.5 * (
+        mutual_information(fused_grad, source1_grad, bins=64)
+        + mutual_information(fused_grad, source2_grad, bins=64)
+    )
 
 
 def artifact_noise_indicator(image):
@@ -123,6 +151,7 @@ def evaluate_fusion(fused, mri, ct):
     mri = _as_bchw(mri).to(fused.device)
     ct = _as_bchw(ct).to(fused.device)
 
+    avg_reference = 0.5 * (mri + ct)
     return {
         "PSNR_MRI": psnr(fused, mri),
         "PSNR_CT": psnr(fused, ct),
@@ -130,6 +159,11 @@ def evaluate_fusion(fused, mri, ct):
         "SSIM_CT": ssim(fused, ct),
         "MI_MRI": mutual_information(fused, mri),
         "MI_CT": mutual_information(fused, ct),
+        "EN": entropy(fused),
+        "CC_MRI": correlation_coefficient(fused, mri),
+        "CC_CT": correlation_coefficient(fused, ct),
+        "CC": correlation_coefficient(fused, avg_reference),
+        "FMI": feature_mutual_information(fused, mri, ct),
         "SF": spatial_frequency(fused),
         "AG": average_gradient(fused),
         "EPI": edge_preservation_index(fused, mri, ct),

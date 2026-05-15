@@ -1,96 +1,151 @@
 import argparse
 import csv
+import sys
 from pathlib import Path
 
 import cv2
 import torch
-from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
-from src.data.paired_dataset import DEFAULT_TEST_ROOTS, PairedMedicalImageDataset, verify_dataset_root
+from src.data.paired_dataset import (
+    AANLIB_ROOT,
+    BRATS_ROOT,
+    PairedMedicalImageDataset,
+    aanlib_split_root,
+    gan_graph_dir,
+    gan_image_dir,
+    gan_metrics_dir,
+    normalize_pair,
+)
 from src.evaluation.metrics import evaluate_fusion
-from src.models.gan import FusionGenerator
 
 
-def save_tensor_image(tensor, path):
+PROJECT_ROOT = Path(__file__).resolve().parent
+METRIC_FIELDS = ["SSIM", "PSNR", "MI", "EN", "CC", "FMI", "SF", "AG"]
+
+
+def resolve_path(path):
+    path = Path(path)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def read_tensor(path, image_size):
+    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        raise ValueError(f"Metric calculation failure. Could not read image: {path}")
+    image = cv2.resize(image, (image_size, image_size), interpolation=cv2.INTER_AREA)
+    image = image.astype("float32") / 255.0
+    return torch.from_numpy(image).unsqueeze(0).unsqueeze(0)
+
+
+def summarize(rows):
+    summary = {"image": "mean +/- std"}
+    for field in METRIC_FIELDS:
+        values = torch.tensor([float(row[field]) for row in rows], dtype=torch.float32)
+        summary[field] = f"{values.mean().item():.6f} +/- {values.std(unbiased=False).item():.6f}"
+    return summary
+
+
+def metrics_for_pair(dataset, fused_dir, image_size):
+    rows = []
+    fused_paths = sorted(fused_dir.glob("*_fused.png"))
+    if not fused_paths:
+        raise FileNotFoundError(f"Metric calculation failure. No fused_original images found in: {fused_dir}")
+    count = min(len(dataset), len(fused_paths))
+    bar = tqdm(range(count), desc=f"Evaluate {dataset.pair}", leave=False, dynamic_ncols=True, file=sys.stdout, ascii=False)
+    for index in bar:
+        sample = dataset[index]
+        fused = read_tensor(fused_paths[index], image_size)
+        source1 = sample["source1"].unsqueeze(0)
+        source2 = sample["source2"].unsqueeze(0)
+        metrics = evaluate_fusion(fused, source2, source1)
+        row = {
+            "image": fused_paths[index].name,
+            "source1_path": sample["source1_path"],
+            "source2_path": sample["source2_path"],
+            "fused_path": str(fused_paths[index]),
+            "SSIM": 0.5 * (metrics["SSIM_MRI"] + metrics["SSIM_CT"]),
+            "PSNR": 0.5 * (metrics["PSNR_MRI"] + metrics["PSNR_CT"]),
+            "MI": 0.5 * (metrics["MI_MRI"] + metrics["MI_CT"]),
+            "EN": metrics["EN"],
+            "CC": metrics["CC"],
+            "FMI": metrics["FMI"],
+            "SF": metrics["SF"],
+            "AG": metrics["AG"],
+        }
+        rows.append(row)
+    return rows
+
+
+def write_metrics_csv(rows, path):
     path.parent.mkdir(parents=True, exist_ok=True)
-    image = tensor.detach().clamp(0.0, 1.0).squeeze().cpu().numpy()
-    cv2.imwrite(str(path), (image * 255.0).astype("uint8"))
+    fieldnames = ["image", "source1_path", "source2_path", "fused_path", *METRIC_FIELDS]
+    with path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+        writer.writerow(summarize(rows))
 
 
-def load_generator(checkpoint_path, device):
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    generator = FusionGenerator().to(device)
-    state_dict = checkpoint["generator"] if isinstance(checkpoint, dict) and "generator" in checkpoint else checkpoint
-    generator.load_state_dict(state_dict, strict=True)
-    generator.eval()
-    return generator
-
-
-@torch.no_grad()
-def evaluate_dataset(generator, dataset, device, sample_dir, max_samples):
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
-    totals = {}
-    for index, batch in enumerate(loader):
-        ct = batch["ct"].to(device)
-        mri = batch["mri"].to(device)
-        fused = generator(ct, mri)
-        metrics = evaluate_fusion(fused, mri, ct)
-        for key, value in metrics.items():
-            totals[key] = totals.get(key, 0.0) + value
-        if index < max_samples:
-            save_tensor_image(fused[0], sample_dir / f"sample_{index + 1:03d}.png")
-
-    count = max(1, len(dataset))
-    return {key: value / count for key, value in totals.items()}
+def update_summary_files(metrics_dir):
+    metric_files = sorted(path for path in metrics_dir.glob("*_metrics.csv") if not path.name.startswith("brats_"))
+    rows = []
+    for path in metric_files:
+        with path.open(newline="", encoding="utf-8") as csv_file:
+            data = list(csv.DictReader(csv_file))
+        if not data:
+            continue
+        summary = data[-1]
+        pair = path.name.removesuffix("_metrics.csv")
+        rows.append({"pair": pair, **{field: summary[field] for field in METRIC_FIELDS}})
+    if not rows:
+        return
+    for filename in ("all_pairs_summary.csv", "thesis_comparison_table.csv"):
+        with (metrics_dir / filename).open("w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=["pair", *METRIC_FIELDS])
+            writer.writeheader()
+            writer.writerows(rows)
+    md_lines = ["| Pair | " + " | ".join(METRIC_FIELDS) + " |", "|" + "---|" * (len(METRIC_FIELDS) + 1)]
+    for row in rows:
+        md_lines.append("| " + row["pair"] + " | " + " | ".join(row[field] for field in METRIC_FIELDS) + " |")
+    (metrics_dir / "thesis_comparison_table.md").write_text("\n".join(md_lines) + "\n", encoding="utf-8")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate GAN fusion on AANLIB/test and BRATS_SPLIT/test.")
-    parser.add_argument("--checkpoint", default="outputs/models/gan/checkpoints/generator_latest.pt")
-    parser.add_argument("--test-roots", nargs="+", default=[str(path) for path in DEFAULT_TEST_ROOTS])
-    parser.add_argument("--output-dir", default="outputs/models/gan/test_results")
+    parser = argparse.ArgumentParser(description="Evaluate metrics from fused_original images only.")
+    parser.add_argument("--dataset-root", default=str(AANLIB_ROOT))
+    parser.add_argument("--pair", choices=["ct_mri", "pet_mri", "spect_mri"], default="ct_mri")
+    parser.add_argument("--split", choices=["test", "train", "val"], default="test")
+    parser.add_argument("--fused-dir", default=None, help="Defaults to outputs/models/gan/images/aanlib/<split>/<pair>/fused_original.")
+    parser.add_argument("--output", default=None, help="Defaults to outputs/models/gan/metrics/<pair>_metrics.csv.")
+    parser.add_argument("--external-test", choices=["brats"], default=None)
+    parser.add_argument("--brats-root", default=str(BRATS_ROOT / "test"))
     parser.add_argument("--image-size", type=int, default=256)
-    parser.add_argument("--max-samples", type=int, default=8)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    pair = normalize_pair(args.pair)
+    dataset_name = "brats" if args.external_test == "brats" else "aanlib"
+    split_root = resolve_path(args.brats_root) if dataset_name == "brats" else aanlib_split_root(resolve_path(args.dataset_root), pair, args.split)
+    fused_dir = resolve_path(args.fused_dir) if args.fused_dir else gan_image_dir(dataset_name, args.split, pair) / "fused_original"
+    output_path = resolve_path(args.output) if args.output else gan_metrics_dir() / (f"brats_{pair}_metrics.csv" if dataset_name == "brats" else f"{pair}_metrics.csv")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    generator = load_generator(args.checkpoint, device)
+    print(f"Checkpoint path: metrics from existing fused_original images")
+    print(f"Fused image folder: {fused_dir}")
+    print(f"Graph folder: {gan_graph_dir()}")
+    print(f"Metrics folder: {gan_metrics_dir()}")
+    if dataset_name == "brats":
+        print("Dataset label: BRATS external generalization testing")
 
-    rows = []
-    overall_totals = {}
-    overall_count = 0
-
-    for root in args.test_roots:
-        root_path = Path(root)
-        dataset_name = "BRATS test" if "BRATS_SPLIT" in str(root_path) else "AANLIB test"
-        verify_dataset_root(root_path, dataset_name=dataset_name, strict=True)
-        dataset = PairedMedicalImageDataset(root_path, image_size=args.image_size, dataset_name=dataset_name, strict=True)
-        metrics = evaluate_dataset(generator, dataset, device, output_dir / "samples" / dataset_name.replace(" ", "_"), args.max_samples)
-
-        row = {"dataset": dataset_name, "pairs": len(dataset), **metrics}
-        rows.append(row)
-        for key, value in metrics.items():
-            overall_totals[key] = overall_totals.get(key, 0.0) + value * len(dataset)
-        overall_count += len(dataset)
-        print(row)
-
-    if overall_count > 0:
-        overall = {key: value / overall_count for key, value in overall_totals.items()}
-        rows.append({"dataset": "overall", "pairs": overall_count, **overall})
-        print(rows[-1])
-
-    csv_path = output_dir / "test_metrics.csv"
-    with csv_path.open("w", newline="") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"Saved test metrics: {csv_path}")
+    dataset = PairedMedicalImageDataset(split_root, image_size=args.image_size, dataset_name=f"{dataset_name} {args.split}", strict=True, pair=pair)
+    rows = metrics_for_pair(dataset, fused_dir, args.image_size)
+    write_metrics_csv(rows, output_path)
+    update_summary_files(gan_metrics_dir())
+    print(f"Saved metrics: {output_path}")
+    print("Metrics source: fused_original only")
+    print("Metrics are computed from fused_original only. fused_color is for visualization only.")
 
 
 if __name__ == "__main__":

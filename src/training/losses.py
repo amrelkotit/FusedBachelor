@@ -41,6 +41,14 @@ def foreground_mask(mri, ct, threshold=0.03, dilation=7):
     return mask.clamp(0.0, 1.0)
 
 
+def source_mask(source, threshold=0.03, dilation=7):
+    mask = (source > threshold).float()
+    if dilation > 1:
+        padding = dilation // 2
+        mask = F.max_pool2d(mask, kernel_size=dilation, stride=1, padding=padding)
+    return mask.clamp(0.0, 1.0)
+
+
 def masked_l1_loss(image, target, mask):
     mask = mask.to(device=image.device, dtype=image.dtype)
     denom = mask.sum().clamp_min(1.0)
@@ -109,6 +117,15 @@ def texture_loss(fused, mri, ct):
     return masked_l1_loss(detail_fused, target_detail, foreground_mask(mri, ct))
 
 
+def source1_preservation_loss(fused, source1):
+    mask = source_mask(source1)
+    intensity = masked_l1_loss(fused, source1, mask)
+    grad = masked_l1_loss(sobel_edges(fused), sobel_edges(source1), mask)
+    texture = masked_l1_loss(high_frequency(fused), high_frequency(source1), mask)
+    structure = ssim_loss(fused * mask, source1 * mask)
+    return intensity, grad, structure, texture
+
+
 def fusion_loss(fused, mri, ct):
     return intensity_loss(fused, mri, ct) + gradient_loss(fused, mri, ct) + structural_loss(fused, mri, ct) + texture_loss(fused, mri, ct)
 
@@ -136,6 +153,10 @@ class MedicalFusionGANLoss(nn.Module):
         lambda_ssim=2.0,
         lambda_texture=3.0,
         lambda_gan=0.1,
+        lambda_source1_intensity=0.0,
+        lambda_source1_gradient=0.0,
+        lambda_source1_ssim=0.0,
+        lambda_source1_texture=0.0,
     ):
         super().__init__()
         self.lambda_intensity = lambda_intensity
@@ -143,18 +164,27 @@ class MedicalFusionGANLoss(nn.Module):
         self.lambda_ssim = lambda_ssim
         self.lambda_texture = lambda_texture
         self.lambda_gan = lambda_gan
+        self.lambda_source1_intensity = lambda_source1_intensity
+        self.lambda_source1_gradient = lambda_source1_gradient
+        self.lambda_source1_ssim = lambda_source1_ssim
+        self.lambda_source1_texture = lambda_source1_texture
 
     def forward(self, fused, mri, ct, d1_fake_logits, d2_fake_logits):
         intensity = intensity_loss(fused, mri, ct)
         grad = gradient_loss(fused, mri, ct)
         ssim = structural_loss(fused, mri, ct)
         texture = texture_loss(fused, mri, ct)
+        src1_intensity, src1_grad, src1_ssim, src1_texture = source1_preservation_loss(fused, ct)
         gan = gan_generator_loss(d1_fake_logits) + gan_generator_loss(d2_fake_logits)
         total = (
             self.lambda_intensity * intensity
             + self.lambda_gradient * grad
             + self.lambda_ssim * ssim
             + self.lambda_texture * texture
+            + self.lambda_source1_intensity * src1_intensity
+            + self.lambda_source1_gradient * src1_grad
+            + self.lambda_source1_ssim * src1_ssim
+            + self.lambda_source1_texture * src1_texture
             + self.lambda_gan * gan
         )
         return {

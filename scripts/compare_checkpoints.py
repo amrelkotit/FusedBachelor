@@ -6,7 +6,7 @@ import cv2
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from src.data.paired_dataset import CombinedMedicalFusionDataset, DEFAULT_TEST_ROOTS, verify_dataset_root
+from src.data.paired_dataset import AANLIB_ROOT, PairedMedicalImageDataset, aanlib_split_root, normalize_pair, verify_dataset_root
 from src.evaluation.metrics import evaluate_fusion
 from src.models.gan import FusionGenerator
 
@@ -62,7 +62,8 @@ def evaluate_checkpoint(checkpoint_path, loader, device, sample_dir, max_samples
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Compare GAN fusion checkpoints numerically and save visual samples.")
-    parser.add_argument("--dataset-roots", nargs="+", default=[str(path) for path in DEFAULT_TEST_ROOTS])
+    parser.add_argument("--dataset-root", default=str(AANLIB_ROOT))
+    parser.add_argument("--pair", choices=["ct_mri", "pet_mri", "spect_mri"], default="ct_mri")
     parser.add_argument("--checkpoints", nargs="+", required=True)
     parser.add_argument("--output-dir", default="outputs/models/gan/checkpoint_comparison")
     parser.add_argument("--image-size", type=int, default=256)
@@ -79,9 +80,10 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    for root in args.dataset_roots:
-        verify_dataset_root(root, dataset_name=str(root), strict=True)
-    dataset = CombinedMedicalFusionDataset(args.dataset_roots, image_size=args.image_size, split_name="test", strict=True)
+    pair = normalize_pair(args.pair)
+    root = aanlib_split_root(args.dataset_root, pair, "test")
+    verify_dataset_root(root, dataset_name=f"AANLIB {pair} test", strict=True, pair=pair)
+    dataset = PairedMedicalImageDataset(root, image_size=args.image_size, dataset_name=f"AANLIB {pair} test", strict=True, pair=pair)
     if args.max_items:
         dataset = Subset(dataset, range(min(args.max_items, len(dataset))))
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)

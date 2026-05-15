@@ -1,30 +1,30 @@
 import argparse
 import csv
+import sys
 from pathlib import Path
-import re
 
 import cv2
+import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
+from src.data.paired_dataset import (
+    AANLIB_ROOT,
+    BRATS_ROOT,
+    PairedMedicalImageDataset,
+    aanlib_split_root,
+    gan_checkpoint_dir,
+    gan_graph_dir,
+    gan_image_dir,
+    gan_metrics_dir,
+    normalize_pair,
+    pair_labels,
+)
 from src.models.gan import FusionGenerator
 
 
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_DATASET_ROOT = PROJECT_ROOT / "data" / "raw" / "final_dataset"
-DEFAULT_CHECKPOINT = Path("outputs") / "models" / "gan_continued_from_50" / "checkpoints" / "best_generator.pt"
-DEFAULT_OUTPUT_DIR = Path("outputs") / "models" / "gan_continued_from_50" / "images"
-DATASET_SPLITS = (
-    ("AANLIB", "train"),
-    ("AANLIB", "test"),
-    ("BRATS", "train"),
-    ("BRATS", "test"),
-)
-
-
-def natural_key(path):
-    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", path.name)]
 
 
 def resolve_path(path):
@@ -32,86 +32,9 @@ def resolve_path(path):
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
-def find_modality_dir(root_dir, names):
-    for name in names:
-        path = root_dir / name
-        if path.is_dir():
-            return path
-    expected = ", ".join(str(root_dir / name) for name in names)
-    raise FileNotFoundError(f"Missing modality folder. Expected one of: {expected}")
-
-
-def list_images(folder):
-    return sorted(
-        (path for path in folder.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS),
-        key=natural_key,
-    )
-
-
-def read_grayscale(path, image_size):
-    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-    if image is None:
-        raise ValueError(f"Could not read image: {path}")
-
-    interpolation = cv2.INTER_AREA if image.shape[0] > image_size or image.shape[1] > image_size else cv2.INTER_CUBIC
-    image = cv2.resize(image, (image_size, image_size), interpolation=interpolation)
-    image = image.astype("float32")
-    min_value = image.min()
-    max_value = image.max()
-    image = (image - min_value) / (max_value - min_value + 1e-8)
-    return torch.from_numpy(image).unsqueeze(0)
-
-
-class PairedSplitDataset(Dataset):
-    def __init__(self, root_dir, image_size):
-        self.root_dir = Path(root_dir)
-        self.image_size = image_size
-        self.ct_dir = find_modality_dir(self.root_dir, ("ct", "CT"))
-        self.mri_dir = find_modality_dir(self.root_dir, ("mri", "MRI"))
-
-        ct_by_name = {path.name.lower(): path for path in list_images(self.ct_dir)}
-        mri_by_name = {path.name.lower(): path for path in list_images(self.mri_dir)}
-        matched_names = sorted(set(ct_by_name) & set(mri_by_name), key=lambda name: natural_key(Path(name)))
-        if not matched_names:
-            raise ValueError(f"No matched CT/MRI image pairs found in: {self.root_dir}")
-
-        self.pairs = [(ct_by_name[name], mri_by_name[name]) for name in matched_names]
-
-    def __len__(self):
-        return len(self.pairs)
-
-    def __getitem__(self, index):
-        ct_path, mri_path = self.pairs[index]
-        return {
-            "ct": read_grayscale(ct_path, self.image_size),
-            "mri": read_grayscale(mri_path, self.image_size),
-            "ct_path": str(ct_path),
-            "mri_path": str(mri_path),
-        }
-
-
-def save_tensor_image(tensor, path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    image = tensor.detach().clamp(0.0, 1.0).squeeze().cpu().numpy()
-    ok = cv2.imwrite(str(path), (image * 255.0).round().astype("uint8"), [cv2.IMWRITE_PNG_COMPRESSION, 0])
-    if not ok:
-        raise IOError(f"Failed to save image: {path}")
-
-
 def tensor_to_uint8(tensor):
     image = tensor.detach().clamp(0.0, 1.0).squeeze().cpu().numpy()
     return (image * 255.0).round().astype("uint8")
-
-
-def enhance_visualization_uint8(image, output_size=512):
-    denoised = cv2.fastNlMeansDenoising(image, None, h=3, templateWindowSize=7, searchWindowSize=21)
-    clahe = cv2.createCLAHE(clipLimit=1.4, tileGridSize=(8, 8))
-    enhanced = clahe.apply(denoised)
-    blurred = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=0.8)
-    enhanced = cv2.addWeighted(enhanced, 1.35, blurred, -0.35, 0)
-    if output_size and enhanced.shape[:2] != (output_size, output_size):
-        enhanced = cv2.resize(enhanced, (output_size, output_size), interpolation=cv2.INTER_CUBIC)
-    return enhanced
 
 
 def save_uint8_image(image, path):
@@ -119,6 +42,52 @@ def save_uint8_image(image, path):
     ok = cv2.imwrite(str(path), image, [cv2.IMWRITE_PNG_COMPRESSION, 0])
     if not ok:
         raise IOError(f"Failed to save image: {path}")
+
+
+def read_source_color(path, size):
+    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise ValueError(f"Could not read source image: {path}")
+    if image.ndim == 2:
+        return None
+    if image.shape[2] == 4:
+        image = image[:, :, :3]
+    if image.shape[2] < 3:
+        return None
+    bgr = image[:, :, :3]
+    channel_delta = np.max(bgr, axis=2).astype(np.int16) - np.min(bgr, axis=2).astype(np.int16)
+    if channel_delta.max() <= 3 or channel_delta.mean() <= 0.5:
+        return None
+    return cv2.resize(bgr, (size[1], size[0]), interpolation=cv2.INTER_AREA)
+
+
+def colorize_fused_from_source(source_bgr, fused_gray):
+    hsv = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2HSV)
+    hsv[:, :, 2] = fused_gray
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+
+def save_comparison_panel(source1, source2, fused, labels, path):
+    images = [tensor_to_uint8(source1), tensor_to_uint8(source2), tensor_to_uint8(fused)]
+    panel = np.concatenate(images, axis=1)
+    label_h = 30
+    canvas = np.full((panel.shape[0] + label_h, panel.shape[1]), 255, dtype=np.uint8)
+    canvas[label_h:, :] = panel
+    for index, label in enumerate(labels):
+        cv2.putText(canvas, label, (index * images[0].shape[1] + 10, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.6, 0, 1, cv2.LINE_AA)
+    save_uint8_image(canvas, path)
+
+
+def save_color_comparison_panel(source1_bgr, source2_gray, fused_bgr, labels, path):
+    source2_bgr = cv2.cvtColor(tensor_to_uint8(source2_gray), cv2.COLOR_GRAY2BGR)
+    images = [source1_bgr, source2_bgr, fused_bgr]
+    panel = np.concatenate(images, axis=1)
+    label_h = 30
+    canvas = np.full((panel.shape[0] + label_h, panel.shape[1], 3), 255, dtype=np.uint8)
+    canvas[label_h:, :] = panel
+    for index, label in enumerate(labels):
+        cv2.putText(canvas, label, (index * images[0].shape[1] + 10, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
+    save_uint8_image(canvas, path)
 
 
 def normalize_state_dict_keys(state_dict):
@@ -140,129 +109,129 @@ def load_generator(checkpoint_path, device):
     checkpoint_path = resolve_path(checkpoint_path)
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    state_dict = normalize_state_dict_keys(extract_generator_state_dict(checkpoint))
-
     generator = FusionGenerator().to(device)
-    generator.load_state_dict(state_dict, strict=True)
+    generator.load_state_dict(normalize_state_dict_keys(extract_generator_state_dict(checkpoint)), strict=True)
     generator.eval()
     return generator, checkpoint_path
 
 
-def ensure_output_tree(output_dir):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    for dataset_name, split_name in DATASET_SPLITS:
-        (output_dir / "fused_original" / dataset_name / split_name).mkdir(parents=True, exist_ok=True)
-        (output_dir / "fused_enhanced_visualization" / dataset_name / split_name).mkdir(parents=True, exist_ok=True)
-        (output_dir / "comparisons" / dataset_name / split_name).mkdir(parents=True, exist_ok=True)
+def dataset_root_for_args(args, pair):
+    if args.external_test == "brats":
+        if pair != "ct_mri":
+            raise ValueError("BRATS external generalization testing is supported only for ct_mri.")
+        return resolve_path(args.brats_root), "brats", "test"
+    return aanlib_split_root(resolve_path(args.dataset_root), pair, args.split), "aanlib", args.split
 
 
 @torch.no_grad()
-def generate_split(generator, dataset_root, output_dir, dataset_name, split_name, args, device, checkpoint_path):
-    split_root = dataset_root / dataset_name / split_name
-    dataset = PairedSplitDataset(split_root, image_size=args.image_size)
+def generate_split(generator, dataset, output_root, labels, checkpoint_path, args, device):
+    fused_dir = output_root / "fused_original"
+    panel_dir = output_root / "comparison_panels"
+    color_dir = output_root / "fused_color"
+    color_panel_dir = output_root / "comparison_panels_color"
+    supports_color_visualization = args.pair in {"pet_mri", "spect_mri"}
+    fused_dir.mkdir(parents=True, exist_ok=True)
+    panel_dir.mkdir(parents=True, exist_ok=True)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
-    original_dir = output_dir / "fused_original" / dataset_name / split_name
-    enhanced_dir = output_dir / "fused_enhanced_visualization" / dataset_name / split_name
-    comparison_dir = output_dir / "comparisons" / dataset_name / split_name
-
     rows = []
     written = 0
-    for batch in loader:
-        ct = batch["ct"].to(device)
-        mri = batch["mri"].to(device)
-        fused = generator(ct, mri)
-
-        batch_size = fused.shape[0]
-        for batch_index in range(batch_size):
+    color_written = 0
+    bar = tqdm(loader, desc=f"Generate {args.pair} {args.split}", leave=False, dynamic_ncols=True, file=sys.stdout, ascii=False)
+    for batch in bar:
+        source1 = batch["source1"].to(device)
+        source2 = batch["source2"].to(device)
+        fused = generator(source1.float(), source2.float()).clamp(0.0, 1.0)
+        for batch_index in range(fused.shape[0]):
             if args.max_items is not None and written >= args.max_items:
                 return rows
-
-            original_path = original_dir / f"{written}_fused.png"
-            enhanced_path = enhanced_dir / f"{written}_fused_enhanced_512.png"
-            comparison_path = comparison_dir / f"{written}_comparison.png"
-            save_tensor_image(fused[batch_index], original_path)
-            fused_u8 = tensor_to_uint8(fused[batch_index])
-            enhanced_u8 = enhance_visualization_uint8(fused_u8, output_size=args.visualization_size)
-            save_uint8_image(enhanced_u8, enhanced_path)
-
-            if args.save_comparisons:
-                ct_u8 = tensor_to_uint8(batch["ct"][batch_index])
-                mri_u8 = tensor_to_uint8(batch["mri"][batch_index])
-                enhanced_for_panel = cv2.resize(enhanced_u8, (args.image_size, args.image_size), interpolation=cv2.INTER_AREA)
-                panel = cv2.hconcat([ct_u8, mri_u8, fused_u8, enhanced_for_panel])
-                save_uint8_image(panel, comparison_path)
+            stem = f"{written:04d}"
+            fused_path = fused_dir / f"{stem}_fused.png"
+            panel_path = panel_dir / f"{stem}_comparison.png"
+            fused_gray = tensor_to_uint8(fused[batch_index])
+            save_uint8_image(fused_gray, fused_path)
+            save_comparison_panel(source1[batch_index], source2[batch_index], fused[batch_index], labels, panel_path)
+            color_path = ""
+            color_panel_path = ""
+            if supports_color_visualization:
+                source1_color = read_source_color(batch["source1_path"][batch_index], fused_gray.shape)
+                if source1_color is not None:
+                    fused_color = colorize_fused_from_source(source1_color, fused_gray)
+                    color_path = color_dir / f"{stem}_fused.png"
+                    color_panel_path = color_panel_dir / f"{stem}_comparison.png"
+                    save_uint8_image(fused_color, color_path)
+                    save_color_comparison_panel(source1_color, source2[batch_index], fused_color, labels, color_panel_path)
+                    color_written += 1
             rows.append(
                 {
-                    "dataset": dataset_name,
-                    "split": split_name,
                     "index": written,
-                    "original_output_path": str(original_path.relative_to(PROJECT_ROOT)),
-                    "enhanced_visualization_path": str(enhanced_path.relative_to(PROJECT_ROOT)),
-                    "comparison_path": str(comparison_path.relative_to(PROJECT_ROOT)) if args.save_comparisons else "",
-                    "ct_path": batch["ct_path"][batch_index],
-                    "mri_path": batch["mri_path"][batch_index],
-                    "checkpoint": str(checkpoint_path.relative_to(PROJECT_ROOT)),
+                    "source1_path": batch["source1_path"][batch_index],
+                    "source2_path": batch["source2_path"][batch_index],
+                    "fused_path": str(fused_path),
+                    "comparison_panel": str(panel_path),
+                    "fused_color_path": str(color_path) if color_path else "",
+                    "comparison_panel_color": str(color_panel_path) if color_panel_path else "",
+                    "checkpoint": str(checkpoint_path),
                 }
             )
             written += 1
-
+        bar.set_postfix(written=written, color=color_written)
     return rows
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Generate all fused GAN PNG images for AANLIB and BRATS train/test splits.")
-    parser.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT), help="Generator checkpoint to load.")
-    parser.add_argument("--dataset-root", default=str(DEFAULT_DATASET_ROOT), help="Root containing AANLIB and BRATS folders.")
-    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Root folder for generated fused images and manifest.")
+    parser = argparse.ArgumentParser(description="Generate raw GAN fused images for one explicit AANLIB pair/split.")
+    parser.add_argument("--dataset-root", default=str(AANLIB_ROOT), help="AANLIB root.")
+    parser.add_argument("--pair", choices=["ct_mri", "pet_mri", "spect_mri"], default="ct_mri")
+    parser.add_argument("--split", choices=["train", "test", "val"], default="test")
+    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--output-dir", default=None, help="Optional explicit output directory.")
+    parser.add_argument("--external-test", choices=["brats"], default=None, help="Opt-in external generalization testing only.")
+    parser.add_argument("--brats-root", default=str(BRATS_ROOT / "test"))
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--max-items", type=int, default=None, help="Optional per-split limit for quick checks.")
-    parser.add_argument("--device", default="auto", help="auto, cuda, cuda:0, or cpu.")
-    parser.add_argument("--visualization-size", type=int, default=512, help="Enhanced visualization output size; raw model output remains image-size.")
-    parser.add_argument("--save-comparisons", action="store_true", default=True, help="Save CT | MRI | fused | enhanced comparison panels.")
+    parser.add_argument("--max-items", type=int, default=None)
+    parser.add_argument("--device", default="auto")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    dataset_root = resolve_path(args.dataset_root)
-    output_dir = resolve_path(args.output_dir)
-    ensure_output_tree(output_dir)
+    args.pair = normalize_pair(args.pair)
+    checkpoint = args.checkpoint or str(gan_checkpoint_dir(args.pair) / "best_generator.pt")
+    device = "cuda" if args.device == "auto" and torch.cuda.is_available() else ("cpu" if args.device == "auto" else args.device)
+    generator, checkpoint_path = load_generator(checkpoint, device)
+    split_root, dataset_name, split = dataset_root_for_args(args, args.pair)
+    output_root = resolve_path(args.output_dir) if args.output_dir else gan_image_dir(dataset_name, split, args.pair)
 
-    if args.device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    else:
-        device = args.device
+    print(f"Checkpoint path: {checkpoint_path}")
+    print(f"Fused image folder: {output_root / 'fused_original'}")
+    if args.pair in {"pet_mri", "spect_mri"}:
+        print(f"Visualization-only color folder: {output_root / 'fused_color'}")
+    print(f"Graph folder: {gan_graph_dir()}")
+    print(f"Metrics folder: {gan_metrics_dir()}")
+    if dataset_name == "brats":
+        print("Dataset label: BRATS external generalization testing")
 
-    generator, checkpoint_path = load_generator(args.checkpoint, device)
-
-    manifest_rows = []
-    for dataset_name, split_name in DATASET_SPLITS:
-        rows = generate_split(generator, dataset_root, output_dir, dataset_name, split_name, args, device, checkpoint_path)
-        manifest_rows.extend(rows)
-        print(f"{dataset_name}/{split_name}: generated {len(rows)} fused image(s)")
-
-    manifest_path = output_dir / "generation_manifest.csv"
+    dataset = PairedMedicalImageDataset(split_root, image_size=args.image_size, dataset_name=f"{dataset_name} {split}", strict=True, pair=args.pair)
+    rows = generate_split(generator, dataset, output_root, pair_labels(args.pair), checkpoint_path, args, device)
+    manifest_path = output_root / "generation_manifest.csv"
     with manifest_path.open("w", newline="", encoding="utf-8") as csv_file:
         fieldnames = [
-            "dataset",
-            "split",
             "index",
-            "original_output_path",
-            "enhanced_visualization_path",
-            "comparison_path",
-            "ct_path",
-            "mri_path",
+            "source1_path",
+            "source2_path",
+            "fused_path",
+            "comparison_panel",
+            "fused_color_path",
+            "comparison_panel_color",
             "checkpoint",
         ]
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(manifest_rows)
-
+        writer.writerows(rows)
+    print(f"Generated {len(rows)} fused image(s)")
     print(f"Saved manifest: {manifest_path}")
-    print(f"Saved fused images under: {output_dir}")
 
 
 if __name__ == "__main__":
