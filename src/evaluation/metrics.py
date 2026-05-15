@@ -68,6 +68,8 @@ def average_gradient(image):
 def mutual_information(image, reference, bins=64):
     image = _as_bchw(image).detach().flatten().clamp(0.0, 1.0)
     reference = _as_bchw(reference).to(image.device).detach().flatten().clamp(0.0, 1.0)
+    if image.numel() == 0 or reference.numel() == 0:
+        return 0.0
     x = torch.clamp((image * (bins - 1)).long(), 0, bins - 1)
     y = torch.clamp((reference * (bins - 1)).long(), 0, bins - 1)
     joint = torch.bincount(x * bins + y, minlength=bins * bins).float().view(bins, bins)
@@ -76,7 +78,8 @@ def mutual_information(image, reference, bins=64):
     py = joint.sum(dim=0, keepdim=True)
     expected = px @ py
     mask = joint > 0
-    return (joint[mask] * torch.log2(joint[mask] / expected[mask].clamp_min(1e-12))).sum().item()
+    value = (joint[mask] * torch.log2(joint[mask] / expected[mask].clamp_min(1e-12))).sum()
+    return _finite_float(value)
 
 
 def entropy(image, bins=256):
@@ -108,14 +111,59 @@ def edge_preservation_index(fused, mri, ct):
     return (fused_centered * source_centered).sum().div(denom).item()
 
 
+def _finite_float(value, default=0.0):
+    value = value.item() if torch.is_tensor(value) else float(value)
+    return value if math.isfinite(value) else default
+
+
+def _feature_normalize(feature, eps=1e-8):
+    feature = feature.detach().float()
+    flat = feature.flatten(start_dim=1)
+    low = torch.quantile(flat, 0.01, dim=1).view(-1, 1, 1, 1)
+    high = torch.quantile(flat, 0.99, dim=1).view(-1, 1, 1, 1)
+    span = high - low
+    normalized = (feature - low) / span.clamp_min(eps)
+    normalized = normalized.clamp(0.0, 1.0)
+    constant = span <= eps
+    if constant.any():
+        normalized = torch.where(constant, torch.zeros_like(normalized), normalized)
+    return normalized
+
+
+def _normalized_mutual_information(image, reference, bins=64, eps=1e-12):
+    image = _as_bchw(image).detach().flatten().clamp(0.0, 1.0)
+    reference = _as_bchw(reference).to(image.device).detach().flatten().clamp(0.0, 1.0)
+    if image.numel() == 0 or reference.numel() == 0:
+        return 0.0
+
+    x = torch.clamp((image * (bins - 1)).long(), 0, bins - 1)
+    y = torch.clamp((reference * (bins - 1)).long(), 0, bins - 1)
+    joint = torch.bincount(x * bins + y, minlength=bins * bins).float().view(bins, bins)
+    joint = joint / joint.sum().clamp_min(1.0)
+    px = joint.sum(dim=1)
+    py = joint.sum(dim=0)
+    expected = px[:, None] * py[None, :]
+    mask = joint > 0
+    mi = (joint[mask] * torch.log2(joint[mask] / expected[mask].clamp_min(eps))).sum()
+    hx = -(px[px > 0] * torch.log2(px[px > 0])).sum()
+    hy = -(py[py > 0] * torch.log2(py[py > 0])).sum()
+    denom = torch.sqrt((hx * hy).clamp_min(eps))
+    if hx <= eps and hy <= eps:
+        return 1.0
+    if hx <= eps or hy <= eps:
+        return 0.0
+    return max(0.0, min(1.0, _finite_float(mi / denom)))
+
+
 def feature_mutual_information(fused, source1, source2):
-    fused_grad = _gradient_magnitude(_as_bchw(fused))
-    source1_grad = _gradient_magnitude(_as_bchw(source1).to(fused_grad.device))
-    source2_grad = _gradient_magnitude(_as_bchw(source2).to(fused_grad.device))
-    return 0.5 * (
-        mutual_information(fused_grad, source1_grad, bins=64)
-        + mutual_information(fused_grad, source2_grad, bins=64)
+    fused_grad = _feature_normalize(_gradient_magnitude(_as_bchw(fused)))
+    source1_grad = _feature_normalize(_gradient_magnitude(_as_bchw(source1).to(fused_grad.device)))
+    source2_grad = _feature_normalize(_gradient_magnitude(_as_bchw(source2).to(fused_grad.device)))
+    value = 0.5 * (
+        _normalized_mutual_information(fused_grad, source1_grad, bins=64)
+        + _normalized_mutual_information(fused_grad, source2_grad, bins=64)
     )
+    return value if math.isfinite(value) else 0.0
 
 
 def artifact_noise_indicator(image):

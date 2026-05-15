@@ -88,6 +88,10 @@ outputs/models/gan/logs/spect_mri_training.log
 
 Best-model selection uses highest SSIM first, then highest FMI, highest PSNR, and lowest validation loss.
 
+Training starts with generator LR `1e-4` and discriminator LR `2.5e-5`. A `ReduceLROnPlateau` scheduler monitors validation loss, reduces learning rates after 5 non-improving validation epochs, and keeps all learning rates at or above `1e-6`.
+
+Validation uses deterministic grayscale loading/resizing and a fixed-seed internal split when no explicit `val` folder exists. Metrics are always computed from `fused_original` only; `fused_color` remains visualization-only.
+
 ## Generation Commands
 
 ```powershell
@@ -118,6 +122,8 @@ outputs/models/gan/metrics/thesis_comparison_table.md
 ```
 
 Metrics include per-image values and mean +/- std for SSIM, PSNR, MI, EN, CC, FMI, SF, and AG.
+
+The final report outputs include per-pair metrics CSV files, mean/std summary tables, training loss and SSIM curves, comparison panels, and thesis figures. PET-MRI and SPECT-MRI thesis figures use colored visualization outputs when `fused_color` exists.
 
 ## Graph Plotting Commands
 
@@ -159,6 +165,38 @@ outputs/models/gan/thesis_figures/spect_mri_qualitative_comparison.png
 ```
 
 For PET-MRI and SPECT-MRI, thesis figures use `fused_color` when it exists and fall back to `fused_original` otherwise. CT-MRI thesis figures always use `fused_original`.
+
+## Final Results
+
+`fused_original` is the raw model output and is the only image set used for metrics and final quantitative tables.
+
+`fused_color` is visualization-only for PET-MRI and SPECT-MRI when the PET/SPECT source image is colored. It is not used in evaluation.
+
+Create final mean/std tables from the existing per-pair metrics CSV files:
+
+```powershell
+python scripts/create_final_results_summary.py
+```
+
+Outputs:
+
+```text
+outputs/models/gan/metrics/final_results_summary.csv
+outputs/models/gan/metrics/final_results_summary.md
+outputs/models/gan/metrics/final_results_summary.tex
+```
+
+Export final thesis-ready assets into one folder:
+
+```powershell
+python scripts/export_final_thesis_assets.py
+```
+
+Final thesis images, clean graphs, metrics CSVs, final results summaries, and generation manifests are copied to:
+
+```text
+outputs/models/gan/final_thesis_assets/
+```
 
 ## BRATS External Generalization
 

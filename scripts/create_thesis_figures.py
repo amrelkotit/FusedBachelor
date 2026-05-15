@@ -92,18 +92,18 @@ def create_figure(pair, dataset_root, split, fused_dir, output_dir, image_size, 
     images = [source1_color if source1_color is not None else to_uint8(sample["source1"]), to_uint8(sample["source2"]), fused_image]
     cmaps = [None if source1_color is not None else "gray", "gray", fused_cmap]
     labels = pair_labels(pair)
-    fig, axes = plt.subplots(1, 3, figsize=(9, 3.4), dpi=220)
+    fig, axes = plt.subplots(1, 3, figsize=(9.6, 3.55), dpi=300)
     for ax, image, label, cmap in zip(axes, images, labels, cmaps):
         if cmap == "gray":
             ax.imshow(image, cmap="gray", vmin=0, vmax=255)
         else:
             ax.imshow(image)
-        ax.set_title(label, fontsize=11)
+        ax.set_title(label, fontsize=15, pad=8, fontweight="semibold")
         ax.axis("off")
-    fig.subplots_adjust(left=0.02, right=0.98, top=0.86, bottom=0.02, wspace=0.04)
+    fig.subplots_adjust(left=0.01, right=0.99, top=0.88, bottom=0.01, wspace=0.035)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{pair}_qualitative_comparison.png"
-    fig.savefig(output_path, facecolor="white")
+    fig.savefig(output_path, facecolor="white", bbox_inches="tight", pad_inches=0.03)
     plt.close(fig)
     return output_path
 

@@ -206,6 +206,10 @@ class GANFusionTrainer:
         lambda_source1_gradient=None,
         lambda_source1_ssim=None,
         lambda_source1_texture=None,
+        lambda_source1_hot=None,
+        lambda_mri_intensity=None,
+        lambda_mri_ssim=None,
+        lambda_mri_texture=None,
         val_split=0.15,
         val_every=1,
         patience=20,
@@ -315,16 +319,35 @@ class GANFusionTrainer:
         self.discriminator1 = PatchDiscriminator(in_channels=1).to(self.device)
         self.discriminator2 = PatchDiscriminator(in_channels=1).to(self.device)
 
-        if self.pair in {"pet_mri", "spect_mri"}:
-            lambda_source1_intensity = 0.6 if lambda_source1_intensity is None else lambda_source1_intensity
-            lambda_source1_gradient = 2.0 if lambda_source1_gradient is None else lambda_source1_gradient
-            lambda_source1_ssim = 0.5 if lambda_source1_ssim is None else lambda_source1_ssim
-            lambda_source1_texture = 1.5 if lambda_source1_texture is None else lambda_source1_texture
+        if self.pair == "ct_mri":
+            if lambda_gradient == 5.0:
+                lambda_gradient = 3.5
+            lambda_source1_intensity = 0.0 if lambda_source1_intensity is None else lambda_source1_intensity
+            lambda_source1_gradient = 0.0 if lambda_source1_gradient is None else lambda_source1_gradient
+            lambda_source1_ssim = 0.0 if lambda_source1_ssim is None else lambda_source1_ssim
+            lambda_source1_texture = 0.0 if lambda_source1_texture is None else lambda_source1_texture
+            lambda_source1_hot = 0.0 if lambda_source1_hot is None else lambda_source1_hot
+            lambda_mri_intensity = 0.45 if lambda_mri_intensity is None else lambda_mri_intensity
+            lambda_mri_ssim = 0.75 if lambda_mri_ssim is None else lambda_mri_ssim
+            lambda_mri_texture = 0.45 if lambda_mri_texture is None else lambda_mri_texture
+        elif self.pair in {"pet_mri", "spect_mri"}:
+            lambda_source1_intensity = 1.0 if lambda_source1_intensity is None else lambda_source1_intensity
+            lambda_source1_gradient = 3.0 if lambda_source1_gradient is None else lambda_source1_gradient
+            lambda_source1_ssim = 0.8 if lambda_source1_ssim is None else lambda_source1_ssim
+            lambda_source1_texture = 2.2 if lambda_source1_texture is None else lambda_source1_texture
+            lambda_source1_hot = 2.0 if lambda_source1_hot is None else lambda_source1_hot
+            lambda_mri_intensity = 0.15 if lambda_mri_intensity is None else lambda_mri_intensity
+            lambda_mri_ssim = 0.25 if lambda_mri_ssim is None else lambda_mri_ssim
+            lambda_mri_texture = 0.15 if lambda_mri_texture is None else lambda_mri_texture
         else:
             lambda_source1_intensity = 0.0 if lambda_source1_intensity is None else lambda_source1_intensity
             lambda_source1_gradient = 0.0 if lambda_source1_gradient is None else lambda_source1_gradient
             lambda_source1_ssim = 0.0 if lambda_source1_ssim is None else lambda_source1_ssim
             lambda_source1_texture = 0.0 if lambda_source1_texture is None else lambda_source1_texture
+            lambda_source1_hot = 0.0 if lambda_source1_hot is None else lambda_source1_hot
+            lambda_mri_intensity = 0.0 if lambda_mri_intensity is None else lambda_mri_intensity
+            lambda_mri_ssim = 0.0 if lambda_mri_ssim is None else lambda_mri_ssim
+            lambda_mri_texture = 0.0 if lambda_mri_texture is None else lambda_mri_texture
 
         self.generator_loss = MedicalFusionGANLoss(
             lambda_intensity=lambda_intensity,
@@ -336,10 +359,23 @@ class GANFusionTrainer:
             lambda_source1_gradient=lambda_source1_gradient,
             lambda_source1_ssim=lambda_source1_ssim,
             lambda_source1_texture=lambda_source1_texture,
+            lambda_source1_hot=lambda_source1_hot,
+            lambda_mri_intensity=lambda_mri_intensity,
+            lambda_mri_ssim=lambda_mri_ssim,
+            lambda_mri_texture=lambda_mri_texture,
         )
         self.optimizer_g = torch.optim.Adam(self.generator.parameters(), lr=self.lr_g, betas=(0.5, 0.999))
         self.optimizer_d1 = torch.optim.Adam(self.discriminator1.parameters(), lr=self.lr_d, betas=(0.5, 0.999))
         self.optimizer_d2 = torch.optim.Adam(self.discriminator2.parameters(), lr=self.lr_d, betas=(0.5, 0.999))
+        self.scheduler_g = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer_g, mode="min", factor=0.5, patience=5, min_lr=1e-6
+        )
+        self.scheduler_d1 = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer_d1, mode="min", factor=0.5, patience=5, min_lr=1e-6
+        )
+        self.scheduler_d2 = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer_d2, mode="min", factor=0.5, patience=5, min_lr=1e-6
+        )
 
         monitor_write(f"Requested batch: {self.requested_batch_size}")
         monitor_write(f"Micro batch: {self.micro_batch_size}")
@@ -350,11 +386,16 @@ class GANFusionTrainer:
         monitor_write(f"AMP mixed precision: {'enabled' if self.amp_enabled else 'disabled'}")
         monitor_write(f"Generator LR: {self.lr_g:.2e}")
         monitor_write(f"Discriminator LR: {self.lr_d:.2e}")
+        monitor_write("LR scheduler: ReduceLROnPlateau(val_loss, patience=5, factor=0.5, min_lr=1e-6)")
         monitor_write(f"Discriminator update interval: every {self.discriminator_update_interval} batch(es)")
         monitor_write(
             f"Source1 preservation weights: intensity={lambda_source1_intensity:.2f}, "
             f"gradient={lambda_source1_gradient:.2f}, ssim={lambda_source1_ssim:.2f}, "
-            f"texture={lambda_source1_texture:.2f}"
+            f"texture={lambda_source1_texture:.2f}, hot={lambda_source1_hot:.2f}"
+        )
+        monitor_write(
+            f"MRI preservation weights: intensity={lambda_mri_intensity:.2f}, "
+            f"ssim={lambda_mri_ssim:.2f}, texture={lambda_mri_texture:.2f}"
         )
 
         self.load_history()
@@ -429,13 +470,16 @@ class GANFusionTrainer:
         self.optimizer_d2.load_state_dict(checkpoint["optimizer_d2"])
         if "scaler" in checkpoint:
             self.scaler.load_state_dict(checkpoint["scaler"])
+        if "scheduler_g" in checkpoint:
+            self.scheduler_g.load_state_dict(checkpoint["scheduler_g"])
+        if "scheduler_d1" in checkpoint:
+            self.scheduler_d1.load_state_dict(checkpoint["scheduler_d1"])
+        if "scheduler_d2" in checkpoint:
+            self.scheduler_d2.load_state_dict(checkpoint["scheduler_d2"])
         self.best_metric = float(checkpoint.get("best_metric", self.best_metric))
         self.best_fmi = float(checkpoint.get("best_fmi", self.best_fmi))
         self.best_psnr = float(checkpoint.get("best_psnr", self.best_psnr))
         self.no_improve_epochs = int(checkpoint.get("no_improve_epochs", self.no_improve_epochs))
-        self._set_optimizer_lr(self.optimizer_g, self.lr_g)
-        self._set_optimizer_lr(self.optimizer_d1, self.lr_d)
-        self._set_optimizer_lr(self.optimizer_d2, self.lr_d)
 
         saved_epoch = int(checkpoint["epoch"])
         self.start_epoch = saved_epoch + 1
@@ -467,6 +511,29 @@ class GANFusionTrainer:
     def _set_optimizer_lr(optimizer, lr):
         for group in optimizer.param_groups:
             group["lr"] = lr
+
+    def current_lrs(self):
+        return {
+            "g": self.optimizer_g.param_groups[0]["lr"],
+            "d1": self.optimizer_d1.param_groups[0]["lr"],
+            "d2": self.optimizer_d2.param_groups[0]["lr"],
+        }
+
+    def step_lr_schedulers(self, val_loss):
+        if val_loss is None or not math.isfinite(val_loss):
+            return
+        before = self.current_lrs()
+        self.scheduler_g.step(val_loss)
+        self.scheduler_d1.step(val_loss)
+        self.scheduler_d2.step(val_loss)
+        after = self.current_lrs()
+        if after != before:
+            monitor_write(
+                "LR scheduler reduced learning rates: "
+                f"G {before['g']:.2e}->{after['g']:.2e}, "
+                f"D1 {before['d1']:.2e}->{after['d1']:.2e}, "
+                f"D2 {before['d2']:.2e}->{after['d2']:.2e}"
+            )
 
     @staticmethod
     def _set_requires_grad(model, enabled):
@@ -543,12 +610,14 @@ class GANFusionTrainer:
         self.optimizer_d2.zero_grad(set_to_none=True)
         self.optimizer_g.zero_grad(set_to_none=True)
 
-    def _real_style_target(self, ct, mri):
+    def _real_style_target(self, ct, mri, deterministic=False):
+        if deterministic:
+            return 0.5 * (ct + mri)
         selector = torch.rand(ct.shape[0], 1, 1, 1, device=ct.device)
         return torch.where(selector > 0.5, ct, mri)
 
-    def _discriminator_losses(self, fused, ct, mri):
-        real_style = self._real_style_target(ct, mri)
+    def _discriminator_losses(self, fused, ct, mri, deterministic=False):
+        real_style = self._real_style_target(ct, mri, deterministic=deterministic)
         real_fused_target = multiscale_fuse(mri=mri, ct=ct).detach()
         d1_real_logits = self.discriminator1(real_fused_target)
         d1_fake_logits = self.discriminator1(fused.detach())
@@ -884,7 +953,7 @@ class GANFusionTrainer:
                 continue
             with autocast("cuda", enabled=self.amp_enabled):
                 g_losses = self._generator_loss_parts(fused.float(), ct.float(), mri.float())
-                d1_loss, d2_loss = self._discriminator_losses(fused.float(), ct.float(), mri.float())
+                d1_loss, d2_loss = self._discriminator_losses(fused.float(), ct.float(), mri.float(), deterministic=True)
             if (
                 not self.is_finite(g_losses["total"], "validation generator total loss", epoch, index + 1)
                 or not self.is_finite(d1_loss, "validation discriminator1 loss", epoch, index + 1)
@@ -926,6 +995,9 @@ class GANFusionTrainer:
             "optimizer_g": self.optimizer_g.state_dict(),
             "optimizer_d1": self.optimizer_d1.state_dict(),
             "optimizer_d2": self.optimizer_d2.state_dict(),
+            "scheduler_g": self.scheduler_g.state_dict(),
+            "scheduler_d1": self.scheduler_d1.state_dict(),
+            "scheduler_d2": self.scheduler_d2.state_dict(),
             "scaler": self.scaler.state_dict(),
             "best_metric": self.best_metric,
             "best_epoch": self.best_epoch,
@@ -958,6 +1030,9 @@ class GANFusionTrainer:
                 "optimizer_g": self.optimizer_g.state_dict(),
                 "optimizer_d1": self.optimizer_d1.state_dict(),
                 "optimizer_d2": self.optimizer_d2.state_dict(),
+                "scheduler_g": self.scheduler_g.state_dict(),
+                "scheduler_d1": self.scheduler_d1.state_dict(),
+                "scheduler_d2": self.scheduler_d2.state_dict(),
                 "scaler": self.scaler.state_dict(),
                 "no_improve_epochs": self.no_improve_epochs,
             },
@@ -979,10 +1054,10 @@ class GANFusionTrainer:
         if not self.history:
             return
         for row in self.history:
-            val_ssim = float(row.get("val_ssim") or float("-inf"))
-            val_fmi = float(row.get("val_fmi") or float("-inf"))
-            val_psnr = float(row.get("val_psnr") or float("-inf"))
-            val_loss = float(row.get("val_total_loss") or float("inf"))
+            val_ssim = self.metric_or_default(row.get("val_ssim"), float("-inf"))
+            val_fmi = self.metric_or_default(row.get("val_fmi"), float("-inf"))
+            val_psnr = self.metric_or_default(row.get("val_psnr"), float("-inf"))
+            val_loss = self.metric_or_default(row.get("val_total_loss"), float("inf"))
             if self.is_better_epoch(val_ssim, val_fmi, val_psnr, val_loss):
                 self.best_epoch = int(row["epoch"])
                 self.best_val_ssim = val_ssim
@@ -991,9 +1066,26 @@ class GANFusionTrainer:
                 self.best_val_loss = val_loss
                 self.best_metric = val_ssim
 
+    @staticmethod
+    def metric_or_default(value, default):
+        if value is None or value == "":
+            return default
+        value = float(value)
+        return value if math.isfinite(value) else default
+
     def is_better_epoch(self, val_ssim, val_fmi, val_psnr, val_loss):
-        candidate = (val_ssim, val_fmi, val_psnr, -val_loss)
-        current = (self.best_val_ssim, self.best_fmi, self.best_psnr, -self.best_val_loss)
+        candidate = (
+            self.metric_or_default(val_ssim, float("-inf")),
+            self.metric_or_default(val_fmi, float("-inf")),
+            self.metric_or_default(val_psnr, float("-inf")),
+            -self.metric_or_default(val_loss, float("inf")),
+        )
+        current = (
+            self.metric_or_default(self.best_val_ssim, float("-inf")),
+            self.metric_or_default(self.best_fmi, float("-inf")),
+            self.metric_or_default(self.best_psnr, float("-inf")),
+            -self.metric_or_default(self.best_val_loss, float("inf")),
+        )
         return candidate > current
 
     def build_history_row(self, epoch, train_values, val_values, is_best):
@@ -1157,10 +1249,15 @@ class GANFusionTrainer:
         best_payload = {
             "best_epoch": self.best_epoch,
             "best_val_ssim": self.best_val_ssim,
+            "best_fmi": self.best_fmi,
+            "best_psnr": self.best_psnr,
             "best_val_loss": self.best_val_loss,
             "latest_epoch": row["epoch"],
             "latest_val_ssim": row["val_ssim"],
             "latest_val_loss": row["val_total_loss"],
+            "learning_rate_g": self.optimizer_g.param_groups[0]["lr"],
+            "learning_rate_d1": self.optimizer_d1.param_groups[0]["lr"],
+            "learning_rate_d2": self.optimizer_d2.param_groups[0]["lr"],
             "analysis": analysis,
         }
         self.best_metrics_path.write_text(json.dumps(best_payload, indent=2))
@@ -1171,8 +1268,12 @@ class GANFusionTrainer:
                     f"Latest epoch: {row['epoch']}",
                     f"Best epoch: {self.best_epoch}",
                     f"Best validation SSIM: {self.best_val_ssim:.6f}",
+                    f"Best FMI: {self.best_fmi:.6f}",
+                    f"Best PSNR: {self.best_psnr:.6f}",
                     f"Best validation loss: {self.best_val_loss:.6f}",
-                    f"Learning rate: {row['learning_rate']}",
+                    f"Generator learning rate: {self.optimizer_g.param_groups[0]['lr']}",
+                    f"Discriminator D1 learning rate: {self.optimizer_d1.param_groups[0]['lr']}",
+                    f"Discriminator D2 learning rate: {self.optimizer_d2.param_groups[0]['lr']}",
                     f"History CSV: {self.history_csv_path}",
                     f"History JSON: {self.history_json_path}",
                     f"Graphs: {self.graph_dir}",
@@ -1241,6 +1342,9 @@ class GANFusionTrainer:
             else:
                 if should_validate:
                     self.no_improve_epochs += 1
+
+            if should_validate:
+                self.step_lr_schedulers(val_loss)
 
             checkpoint_path = self.save_checkpoint(epoch)
             row = self.build_history_row(epoch, train_values, val_values, is_best)

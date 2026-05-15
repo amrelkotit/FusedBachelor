@@ -66,6 +66,10 @@ def parse_args():
     parser.add_argument("--lambda-source1-gradient", type=float, default=None)
     parser.add_argument("--lambda-source1-ssim", type=float, default=None)
     parser.add_argument("--lambda-source1-texture", type=float, default=None)
+    parser.add_argument("--lambda-source1-hot", type=float, default=None)
+    parser.add_argument("--lambda-mri-intensity", type=float, default=None)
+    parser.add_argument("--lambda-mri-ssim", type=float, default=None)
+    parser.add_argument("--lambda-mri-texture", type=float, default=None)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-items", type=int, default=None)
     parser.add_argument("--resume", default=None)
@@ -114,6 +118,10 @@ def main():
         lambda_source1_gradient=args.lambda_source1_gradient,
         lambda_source1_ssim=args.lambda_source1_ssim,
         lambda_source1_texture=args.lambda_source1_texture,
+        lambda_source1_hot=args.lambda_source1_hot,
+        lambda_mri_intensity=args.lambda_mri_intensity,
+        lambda_mri_ssim=args.lambda_mri_ssim,
+        lambda_mri_texture=args.lambda_mri_texture,
         val_split=args.val_split,
         val_every=args.val_every,
         patience=args.patience,
