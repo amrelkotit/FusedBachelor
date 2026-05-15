@@ -21,6 +21,7 @@ from src.data.paired_dataset import (
     normalize_pair,
     pair_labels,
 )
+from src.fusion.decomposition import multiscale_fuse
 from src.models.gan import FusionGenerator
 
 
@@ -67,13 +68,17 @@ def colorize_fused_from_source(source_bgr, fused_gray):
     return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
 
-def save_comparison_panel(source1, source2, fused, labels, path):
+def save_comparison_panel(source1, source2, fused, labels, path, msfd_guidance=None):
     images = [tensor_to_uint8(source1), tensor_to_uint8(source2), tensor_to_uint8(fused)]
+    panel_labels = list(labels)
+    if msfd_guidance is not None:
+        images.insert(2, tensor_to_uint8(msfd_guidance))
+        panel_labels = [labels[0], labels[1], "MSFD guidance", labels[2]]
     panel = np.concatenate(images, axis=1)
     label_h = 30
     canvas = np.full((panel.shape[0] + label_h, panel.shape[1]), 255, dtype=np.uint8)
     canvas[label_h:, :] = panel
-    for index, label in enumerate(labels):
+    for index, label in enumerate(panel_labels):
         cv2.putText(canvas, label, (index * images[0].shape[1] + 10, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.6, 0, 1, cv2.LINE_AA)
     save_uint8_image(canvas, path)
 
@@ -130,9 +135,12 @@ def generate_split(generator, dataset, output_root, labels, checkpoint_path, arg
     panel_dir = output_root / "comparison_panels"
     color_dir = output_root / "fused_color"
     color_panel_dir = output_root / "comparison_panels_color"
+    msfd_preview_dir = output_root / "msfd_guidance_preview"
     supports_color_visualization = args.pair in {"pet_mri", "spect_mri"}
     fused_dir.mkdir(parents=True, exist_ok=True)
     panel_dir.mkdir(parents=True, exist_ok=True)
+    if args.save_msfd_guidance_preview:
+        msfd_preview_dir.mkdir(parents=True, exist_ok=True)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
     rows = []
     written = 0
@@ -142,15 +150,29 @@ def generate_split(generator, dataset, output_root, labels, checkpoint_path, arg
         source1 = batch["source1"].to(device)
         source2 = batch["source2"].to(device)
         fused = generator(source1.float(), source2.float()).clamp(0.0, 1.0)
+        msfd_guidance = None
+        if args.save_msfd_guidance_preview:
+            msfd_guidance = multiscale_fuse(source1=source1.float(), source2=source2.float()).to(device=device, dtype=fused.dtype).clamp(0.0, 1.0)
         for batch_index in range(fused.shape[0]):
             if args.max_items is not None and written >= args.max_items:
                 return rows
             stem = f"{written:04d}"
             fused_path = fused_dir / f"{stem}_fused.png"
             panel_path = panel_dir / f"{stem}_comparison.png"
+            msfd_preview_path = ""
             fused_gray = tensor_to_uint8(fused[batch_index])
             save_uint8_image(fused_gray, fused_path)
-            save_comparison_panel(source1[batch_index], source2[batch_index], fused[batch_index], labels, panel_path)
+            if msfd_guidance is not None:
+                msfd_preview_path = msfd_preview_dir / f"{stem}_msfd_guidance.png"
+                save_uint8_image(tensor_to_uint8(msfd_guidance[batch_index]), msfd_preview_path)
+            save_comparison_panel(
+                source1[batch_index],
+                source2[batch_index],
+                fused[batch_index],
+                labels,
+                panel_path,
+                msfd_guidance=msfd_guidance[batch_index] if msfd_guidance is not None else None,
+            )
             color_path = ""
             color_panel_path = ""
             if supports_color_visualization:
@@ -171,6 +193,7 @@ def generate_split(generator, dataset, output_root, labels, checkpoint_path, arg
                     "comparison_panel": str(panel_path),
                     "fused_color_path": str(color_path) if color_path else "",
                     "comparison_panel_color": str(color_panel_path) if color_panel_path else "",
+                    "msfd_guidance_preview_path": str(msfd_preview_path) if msfd_preview_path else "",
                     "checkpoint": str(checkpoint_path),
                 }
             )
@@ -192,6 +215,7 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-items", type=int, default=None)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--save-msfd-guidance-preview", action="store_true", help="Save rule-based MSFD guidance beside generator output for visual comparison only.")
     return parser.parse_args()
 
 
@@ -206,6 +230,8 @@ def main():
 
     print(f"Checkpoint path: {checkpoint_path}")
     print(f"Fused image folder: {output_root / 'fused_original'}")
+    if args.save_msfd_guidance_preview:
+        print(f"MSFD guidance preview folder: {output_root / 'msfd_guidance_preview'}")
     if args.pair in {"pet_mri", "spect_mri"}:
         print(f"Visualization-only color folder: {output_root / 'fused_color'}")
     print(f"Graph folder: {gan_graph_dir()}")
@@ -225,6 +251,7 @@ def main():
             "comparison_panel",
             "fused_color_path",
             "comparison_panel_color",
+            "msfd_guidance_preview_path",
             "checkpoint",
         ]
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)

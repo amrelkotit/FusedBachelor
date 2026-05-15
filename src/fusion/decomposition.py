@@ -101,41 +101,51 @@ def histogram_match(source, reference, bins=256):
     return matched
 
 
-def fuse_low_frequency(mri_low, ct_low, histogram_weight=0.5):
+def fuse_low_frequency(source2_low, source1_low, histogram_weight=0.5):
     """Blend base layers while favoring the locally more informative modality."""
-    matched_ct = histogram_match(ct_low, mri_low)
-    mri_activity = local_activity(mri_low)
-    ct_activity = local_activity(matched_ct)
-    mri_weight = (mri_activity + 1e-6) / (mri_activity + ct_activity + 2e-6)
-    adaptive = mri_weight * mri_low + (1.0 - mri_weight) * matched_ct
-    average = histogram_weight * mri_low + (1.0 - histogram_weight) * matched_ct
+    matched_source1 = histogram_match(source1_low, source2_low)
+    source2_activity = local_activity(source2_low)
+    source1_activity = local_activity(matched_source1)
+    source2_weight = (source2_activity + 1e-6) / (source2_activity + source1_activity + 2e-6)
+    adaptive = source2_weight * source2_low + (1.0 - source2_weight) * matched_source1
+    average = histogram_weight * source2_low + (1.0 - histogram_weight) * matched_source1
     return 0.7 * adaptive + 0.3 * average
 
 
-def fuse_high_frequency(mri_highs, ct_highs):
+def fuse_high_frequency(source2_highs, source1_highs):
     """Soft-select sharp detail coefficients instead of hard max switching."""
     fused_highs = []
-    for mri_high, ct_high in zip(mri_highs, ct_highs):
-        mri_strength = torch.abs(mri_high)
-        ct_strength = torch.abs(ct_high)
-        weights = torch.softmax(torch.cat([mri_strength, ct_strength], dim=1) * 8.0, dim=1)
-        mri_weight = weights[:, 0:1]
-        ct_weight = weights[:, 1:2]
-        fused_highs.append(mri_weight * mri_high + ct_weight * ct_high)
+    for source2_high, source1_high in zip(source2_highs, source1_highs):
+        source2_strength = torch.abs(source2_high)
+        source1_strength = torch.abs(source1_high)
+        weights = torch.softmax(torch.cat([source2_strength, source1_strength], dim=1) * 8.0, dim=1)
+        source2_weight = weights[:, 0:1]
+        source1_weight = weights[:, 1:2]
+        fused_highs.append(source2_weight * source2_high + source1_weight * source1_high)
     return fused_highs
 
 
-def multiscale_fuse(mri, ct, levels=3, kernel_size=5, sigma=1.0):
-    """Fuse paired grayscale MRI/CT tensors using MSFD-like decomposition."""
-    mri = _as_bchw(mri)
-    ct = _as_bchw(ct).to(mri.device)
+def multiscale_fuse(source1=None, source2=None, levels=3, kernel_size=5, sigma=1.0, **legacy_kwargs):
+    """Fuse paired grayscale tensors using MSFD-like decomposition."""
+    if source1 is None and "ct" in legacy_kwargs:
+        source1 = legacy_kwargs.pop("ct")
+    if source2 is None and "mri" in legacy_kwargs:
+        source2 = legacy_kwargs.pop("mri")
+    if legacy_kwargs:
+        unexpected = ", ".join(sorted(legacy_kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unexpected}")
+    if source1 is None or source2 is None:
+        raise TypeError("multiscale_fuse() requires source1 and source2 tensors")
 
-    if mri.shape != ct.shape:
-        raise ValueError(f"MRI and CT tensors must have same shape, got {mri.shape} and {ct.shape}")
+    source1 = _as_bchw(source1)
+    source2 = _as_bchw(source2).to(source1.device)
 
-    mri_parts = msfd_decompose(mri, levels=levels, kernel_size=kernel_size, sigma=sigma)
-    ct_parts = msfd_decompose(ct, levels=levels, kernel_size=kernel_size, sigma=sigma)
+    if source1.shape != source2.shape:
+        raise ValueError(f"Input tensors must have same shape, got {source1.shape} and {source2.shape}")
 
-    fused_low = fuse_low_frequency(mri_parts["low"], ct_parts["low"])
-    fused_highs = fuse_high_frequency(mri_parts["highs"], ct_parts["highs"])
+    source1_parts = msfd_decompose(source1, levels=levels, kernel_size=kernel_size, sigma=sigma)
+    source2_parts = msfd_decompose(source2, levels=levels, kernel_size=kernel_size, sigma=sigma)
+
+    fused_low = fuse_low_frequency(source2_parts["low"], source1_parts["low"])
+    fused_highs = fuse_high_frequency(source2_parts["highs"], source1_parts["highs"])
     return reconstruct_from_decomposition(fused_low, fused_highs)

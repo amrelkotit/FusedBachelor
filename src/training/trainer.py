@@ -37,6 +37,7 @@ import numpy as np
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
+import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -78,6 +79,8 @@ HISTORY_FIELDS = [
     "val_texture_loss",
     "train_gan_loss",
     "val_gan_loss",
+    "train_msfd_loss",
+    "val_msfd_loss",
     "train_d1_loss",
     "val_d1_loss",
     "train_d2_loss",
@@ -202,6 +205,8 @@ class GANFusionTrainer:
         lambda_ssim=2.0,
         lambda_texture=3.0,
         lambda_gan=0.1,
+        use_msfd_guidance=True,
+        lambda_msfd=1.0,
         lambda_source1_intensity=None,
         lambda_source1_gradient=None,
         lambda_source1_ssim=None,
@@ -255,6 +260,8 @@ class GANFusionTrainer:
         self.lr_g = lr
         self.lr_d = lr * discriminator_lr_factor
         self.discriminator_update_interval = discriminator_update_interval
+        self.use_msfd_guidance = bool(use_msfd_guidance)
+        self.lambda_msfd = float(lambda_msfd)
         self.device = resolve_training_device(device, allow_cpu=allow_cpu)
         if self.device.startswith("cuda"):
             torch.backends.cudnn.benchmark = True
@@ -388,6 +395,10 @@ class GANFusionTrainer:
         monitor_write(f"Discriminator LR: {self.lr_d:.2e}")
         monitor_write("LR scheduler: ReduceLROnPlateau(val_loss, patience=5, factor=0.5, min_lr=1e-6)")
         monitor_write(f"Discriminator update interval: every {self.discriminator_update_interval} batch(es)")
+        if self.use_msfd_guidance:
+            monitor_write(f"MSFD guidance: enabled, lambda_msfd={self.lambda_msfd}")
+        else:
+            monitor_write("MSFD guidance: disabled")
         monitor_write(
             f"Source1 preservation weights: intensity={lambda_source1_intensity:.2f}, "
             f"gradient={lambda_source1_gradient:.2f}, ssim={lambda_source1_ssim:.2f}, "
@@ -618,7 +629,7 @@ class GANFusionTrainer:
 
     def _discriminator_losses(self, fused, ct, mri, deterministic=False):
         real_style = self._real_style_target(ct, mri, deterministic=deterministic)
-        real_fused_target = multiscale_fuse(mri=mri, ct=ct).detach()
+        real_fused_target = multiscale_fuse(source1=ct, source2=mri).detach()
         d1_real_logits = self.discriminator1(real_fused_target)
         d1_fake_logits = self.discriminator1(fused.detach())
         d2_real_logits = self.discriminator2(real_style)
@@ -640,16 +651,33 @@ class GANFusionTrainer:
 
         return d1_loss.detach(), d2_loss.detach()
 
+    def _msfd_guidance(self, source1, source2, fused):
+        guidance = multiscale_fuse(source1=source1, source2=source2).detach()
+        guidance = guidance.to(device=fused.device, dtype=fused.dtype)
+        if guidance.shape != fused.shape:
+            guidance = F.interpolate(guidance, size=fused.shape[-2:], mode="bilinear", align_corners=False)
+            if guidance.shape[1] != fused.shape[1]:
+                guidance = guidance[:, : fused.shape[1]]
+        return guidance.clamp(0.0, 1.0)
+
     def _generator_loss_parts(self, fused, ct, mri):
         d1_fake_logits = self.discriminator1(fused)
         d2_fake_logits = self.discriminator2(fused)
-        return self.generator_loss(
+        losses = self.generator_loss(
             fused=fused,
             mri=mri,
             ct=ct,
             d1_fake_logits=d1_fake_logits,
             d2_fake_logits=d2_fake_logits,
         )
+        if self.use_msfd_guidance:
+            msfd_guidance = self._msfd_guidance(source1=ct, source2=mri, fused=fused)
+            msfd_loss = F.l1_loss(fused, msfd_guidance)
+            losses["total"] = losses["total"] + self.lambda_msfd * msfd_loss
+            losses["msfd"] = msfd_loss.detach()
+        else:
+            losses["msfd"] = fused.new_tensor(0.0)
+        return losses
 
     def _train_generator(self, fused, ct, mri):
         self.optimizer_g.zero_grad(set_to_none=True)
@@ -687,6 +715,7 @@ class GANFusionTrainer:
             "ssim_loss": 0.0,
             "texture_loss": 0.0,
             "gan_loss": 0.0,
+            "msfd_loss": 0.0,
             "d1_loss": 0.0,
             "d2_loss": 0.0,
             "psnr": 0.0,
@@ -785,6 +814,7 @@ class GANFusionTrainer:
                     or not self.is_finite(g_losses["ssim"], "ssim loss", epoch, batch_index)
                     or not self.is_finite(g_losses["texture"], "texture loss", epoch, batch_index)
                     or not self.is_finite(g_losses["gan"], "gan loss", epoch, batch_index)
+                    or not self.is_finite(g_losses["msfd"], "msfd guidance loss", epoch, batch_index)
                 ):
                     skip_window = True
                     skipped_batches += 1
@@ -876,6 +906,7 @@ class GANFusionTrainer:
             totals["ssim_loss"] += g_losses["ssim"].item()
             totals["texture_loss"] += g_losses["texture"].item()
             totals["gan_loss"] += g_losses["gan"].item()
+            totals["msfd_loss"] += g_losses["msfd"].item()
             totals["d1_loss"] += d1_loss.item()
             totals["d2_loss"] += d2_loss.item()
             for key, value in metric_values.items():
@@ -913,6 +944,7 @@ class GANFusionTrainer:
             "ssim_loss": 0.0,
             "texture_loss": 0.0,
             "gan_loss": 0.0,
+            "msfd_loss": 0.0,
             "d1_loss": 0.0,
             "d2_loss": 0.0,
             "psnr": 0.0,
@@ -969,6 +1001,7 @@ class GANFusionTrainer:
             totals["ssim_loss"] += g_losses["ssim"].item()
             totals["texture_loss"] += g_losses["texture"].item()
             totals["gan_loss"] += g_losses["gan"].item()
+            totals["msfd_loss"] += g_losses["msfd"].item()
             totals["d1_loss"] += d1_loss.item()
             totals["d2_loss"] += d2_loss.item()
             for key, value in metric_values.items():
@@ -1006,6 +1039,8 @@ class GANFusionTrainer:
             "best_psnr": self.best_psnr,
             "best_val_loss": self.best_val_loss,
             "no_improve_epochs": self.no_improve_epochs,
+            "use_msfd_guidance": self.use_msfd_guidance,
+            "lambda_msfd": self.lambda_msfd,
         }
         torch.save(payload, path)
         torch.save(payload, self.checkpoint_dir / "latest_checkpoint.pt")
@@ -1035,6 +1070,8 @@ class GANFusionTrainer:
                 "scheduler_d2": self.scheduler_d2.state_dict(),
                 "scaler": self.scaler.state_dict(),
                 "no_improve_epochs": self.no_improve_epochs,
+                "use_msfd_guidance": self.use_msfd_guidance,
+                "lambda_msfd": self.lambda_msfd,
             },
             full_path,
         )
@@ -1106,6 +1143,8 @@ class GANFusionTrainer:
             "val_texture_loss": val_values.get("texture_loss"),
             "train_gan_loss": train_values.get("gan_loss"),
             "val_gan_loss": val_values.get("gan_loss"),
+            "train_msfd_loss": train_values.get("msfd_loss") if self.use_msfd_guidance else None,
+            "val_msfd_loss": val_values.get("msfd_loss") if self.use_msfd_guidance else None,
             "train_d1_loss": train_values.get("d1_loss"),
             "val_d1_loss": val_values.get("d1_loss"),
             "train_d2_loss": train_values.get("d2_loss"),
@@ -1258,6 +1297,10 @@ class GANFusionTrainer:
             "learning_rate_g": self.optimizer_g.param_groups[0]["lr"],
             "learning_rate_d1": self.optimizer_d1.param_groups[0]["lr"],
             "learning_rate_d2": self.optimizer_d2.param_groups[0]["lr"],
+            "use_msfd_guidance": self.use_msfd_guidance,
+            "lambda_msfd": self.lambda_msfd,
+            "latest_train_msfd_loss": row.get("train_msfd_loss"),
+            "latest_val_msfd_loss": row.get("val_msfd_loss"),
             "analysis": analysis,
         }
         self.best_metrics_path.write_text(json.dumps(best_payload, indent=2))
@@ -1274,6 +1317,8 @@ class GANFusionTrainer:
                     f"Generator learning rate: {self.optimizer_g.param_groups[0]['lr']}",
                     f"Discriminator D1 learning rate: {self.optimizer_d1.param_groups[0]['lr']}",
                     f"Discriminator D2 learning rate: {self.optimizer_d2.param_groups[0]['lr']}",
+                    f"MSFD guidance: {'enabled' if self.use_msfd_guidance else 'disabled'}",
+                    f"Lambda MSFD: {self.lambda_msfd}",
                     f"History CSV: {self.history_csv_path}",
                     f"History JSON: {self.history_json_path}",
                     f"Graphs: {self.graph_dir}",
@@ -1288,6 +1333,10 @@ class GANFusionTrainer:
         line = (
             f"epoch={epoch:03d} "
             f"train_loss={train_values.get('total_loss'):.6f} "
+            f"msfd_guidance={self.use_msfd_guidance} "
+            f"lambda_msfd={self.lambda_msfd:.6f} "
+            f"train_msfd_loss={train_values.get('msfd_loss') if self.use_msfd_guidance else 'disabled'} "
+            f"val_msfd_loss={val_values.get('msfd_loss') if self.use_msfd_guidance and val_values.get('msfd_loss') is not None else 'skipped'} "
             f"skipped_updates={int(train_values.get('skipped_updates', 0))} "
             f"skipped_batches={int(train_values.get('skipped_batches', 0))} "
             f"skipped_d_steps={int(train_values.get('skipped_d_steps', 0))} "
@@ -1355,9 +1404,11 @@ class GANFusionTrainer:
 
             val_loss_text = f"{val_loss:.4f}" if val_loss is not None else "skipped"
             val_ssim_text = f"{val_ssim:.4f}" if val_ssim is not None else "skipped"
+            msfd_text = f"train_msfd={train_values.get('msfd_loss', 0.0):.4f} | " if self.use_msfd_guidance else ""
             monitor_write(
                 f"Epoch {epoch:03d}/{self.epochs:03d} | "
                 f"train_loss={train_values['total_loss']:.4f} | "
+                f"{msfd_text}"
                 f"skipped_updates={int(train_values.get('skipped_updates', 0))} | "
                 f"skipped_batches={int(train_values.get('skipped_batches', 0))} | "
                 f"skipped_d_steps={int(train_values.get('skipped_d_steps', 0))} | "

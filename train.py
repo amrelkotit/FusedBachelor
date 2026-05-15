@@ -57,6 +57,9 @@ def parse_args():
     parser.add_argument("--lambda-ssim", type=float, default=2.0)
     parser.add_argument("--lambda-texture", type=float, default=3.0)
     parser.add_argument("--lambda-gan", type=float, default=0.1)
+    parser.add_argument("--use-msfd-guidance", dest="use_msfd_guidance", action="store_true", default=True, help="Use MSFD guidance L1 loss during generator training. Enabled by default.")
+    parser.add_argument("--no-msfd-guidance", dest="use_msfd_guidance", action="store_false", help="Disable MSFD guidance and use the old normal GAN training objective.")
+    parser.add_argument("--lambda-msfd", type=float, default=1.0, help="Weight for MSFD guidance L1 loss.")
     parser.add_argument("--lambda-grad", type=float, default=None, help="Deprecated alias for --lambda-gradient.")
     parser.add_argument("--val-split", type=float, default=0.15, help="Deterministic internal validation split when AANLIB/<pair>/val is absent.")
     parser.add_argument("--val-every", type=int, default=1)
@@ -114,6 +117,8 @@ def main():
         lambda_ssim=args.lambda_ssim,
         lambda_texture=args.lambda_texture,
         lambda_gan=args.lambda_gan,
+        use_msfd_guidance=args.use_msfd_guidance,
+        lambda_msfd=args.lambda_msfd,
         lambda_source1_intensity=args.lambda_source1_intensity,
         lambda_source1_gradient=args.lambda_source1_gradient,
         lambda_source1_ssim=args.lambda_source1_ssim,
