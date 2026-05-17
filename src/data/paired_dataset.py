@@ -11,6 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 AANLIB_ROOT = PROJECT_ROOT / "data" / "raw" / "AANLIB"
 BRATS_ROOT = PROJECT_ROOT / "data" / "raw" / "final_dataset" / "BRATS"
 GAN_OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "models" / "gan"
+DIFFUSION_OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "models" / "diffusion"
 
 PAIR_CONFIGS = {
     "ct_mri": {"folder": "CT-MRI", "source1": "CT", "source2": "MRI"},
@@ -73,6 +74,57 @@ def gan_logs_dir():
 
 def gan_thesis_figures_dir():
     return GAN_OUTPUT_ROOT / "thesis_figures"
+
+
+def diffusion_experiment_name(pair, dataset_name="aanlib"):
+    return f"{dataset_name}_{normalize_pair(pair)}"
+
+
+def diffusion_pair_dir(pair, dataset_name="aanlib", output_root=None):
+    root = Path(output_root) if output_root else DIFFUSION_OUTPUT_ROOT
+    return root / diffusion_experiment_name(pair, dataset_name)
+
+
+def diffusion_checkpoint_dir(pair, dataset_name="aanlib", output_root=None):
+    return diffusion_pair_dir(pair, dataset_name, output_root=output_root) / "checkpoints"
+
+
+def diffusion_sample_dir(pair, dataset_name="aanlib", output_root=None):
+    return diffusion_pair_dir(pair, dataset_name, output_root=output_root) / "samples"
+
+
+def diffusion_pair_logs_dir(pair, dataset_name="aanlib", output_root=None):
+    return diffusion_pair_dir(pair, dataset_name, output_root=output_root) / "logs"
+
+
+def diffusion_image_dir(dataset_name, pair, split, output_root=None):
+    root = Path(output_root) if output_root else DIFFUSION_OUTPUT_ROOT
+    return root / "images" / dataset_name / normalize_pair(pair) / split
+
+
+def diffusion_after_msfd_dir(dataset_name, pair, output_root=None):
+    root = Path(output_root) if output_root else DIFFUSION_OUTPUT_ROOT
+    return root / "images_after_msfd" / dataset_name / normalize_pair(pair)
+
+
+def diffusion_graph_dir(output_root=None):
+    root = Path(output_root) if output_root else DIFFUSION_OUTPUT_ROOT
+    return root / "graphs"
+
+
+def diffusion_metrics_dir(output_root=None):
+    root = Path(output_root) if output_root else DIFFUSION_OUTPUT_ROOT
+    return root / "metrics"
+
+
+def diffusion_logs_dir(output_root=None):
+    root = Path(output_root) if output_root else DIFFUSION_OUTPUT_ROOT
+    return root / "logs"
+
+
+def diffusion_final_assets_dir(output_root=None):
+    root = Path(output_root) if output_root else DIFFUSION_OUTPUT_ROOT
+    return root / "final_thesis_assets"
 
 
 def _natural_key(path):
