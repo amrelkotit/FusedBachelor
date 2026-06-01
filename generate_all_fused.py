@@ -62,10 +62,87 @@ def read_source_color(path, size):
     return cv2.resize(bgr, (size[1], size[0]), interpolation=cv2.INTER_AREA)
 
 
+def _enhance_fused_gray_for_spect(fused_gray):
+    """CLAHE + unsharp-mask + Laplacian edge boost on a denoised SPECT luma channel."""
+    clahe = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(6, 6))
+    enhanced = clahe.apply(fused_gray)
+    blur = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=0.7)
+    sharpened = cv2.addWeighted(enhanced, 1.75, blur, -0.75, 0)
+    lap = cv2.Laplacian(sharpened, cv2.CV_32F)
+    return np.clip(sharpened.astype(np.float32) - 0.35 * lap, 0, 255).astype(np.uint8)
+
+
+def colorize_fused_pet_spect(source_bgr, fused_gray):
+    """Colorize a PET/SPECT fused image.
+
+    Applies CLAHE + unsharp-mask to the (already denoised) luma, then either:
+    - transfers it into the source YCrCb space with a mild chrominance boost, or
+    - maps it through COLORMAP_HOT when the source has no colour information.
+    """
+    enhanced = _enhance_fused_gray_for_spect(fused_gray)
+    if source_bgr is None:
+        return cv2.applyColorMap(enhanced, cv2.COLORMAP_HOT)
+    ycrcb = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2YCrCb)
+    ycrcb[:, :, 0] = enhanced
+    for ch in (1, 2):
+        deviation = ycrcb[:, :, ch].astype(np.int16) - 128
+        ycrcb[:, :, ch] = np.clip(128 + deviation * 1.50, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+
+
+def ycrcb_colorize(source_bgr, mri_u8, alpha=0.70):
+    """Color from source SPECT/PET Cr/Cb channels + MRI as luminance + brain mask.
+
+    Using MRI as Y gives crisp anatomical structure while the source color channels
+    preserve the functional (SPECT/PET) pseudocolor encoding.  The result is then
+    blended 70/30 with the enhanced MRI gray background for the same layered look
+    as the AdaFuse reference images.
+    """
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    mri_enhanced = clahe.apply(mri_u8)
+    ycrcb = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2YCrCb)
+    ycrcb[:, :, 0] = cv2.normalize(mri_enhanced, None, 0, 255, cv2.NORM_MINMAX)
+    colored_bgr = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+    mri_bgr = cv2.cvtColor(mri_enhanced, cv2.COLOR_GRAY2BGR)
+    blended = cv2.addWeighted(colored_bgr, alpha, mri_bgr, 1.0 - alpha, 0)
+    _, mask = cv2.threshold(mri_enhanced, 15, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return cv2.bitwise_and(blended, cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR))
+
+
+def adafuse_colorize(functional_u8, mri_u8, alpha=0.65):
+    """Fallback colorizer when source has no color: hot colormap over MRI background."""
+    functional_norm = cv2.normalize(functional_u8, None, 0, 255, cv2.NORM_MINMAX)
+    hot_bgr = cv2.applyColorMap(functional_norm, cv2.COLORMAP_HOT)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    mri_enhanced = clahe.apply(mri_u8)
+    mri_bgr = cv2.cvtColor(mri_enhanced, cv2.COLOR_GRAY2BGR)
+    blended = cv2.addWeighted(hot_bgr, alpha, mri_bgr, 1.0 - alpha, 0)
+    _, mask = cv2.threshold(mri_enhanced, 15, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return cv2.bitwise_and(blended, cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR))
+
+
 def colorize_fused_from_source(source_bgr, fused_gray):
-    hsv = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2HSV)
-    hsv[:, :, 2] = fused_gray
-    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    """Colorize a CT-MRI fused image using CLAHE + unsharp mask + YCbCr transfer.
+
+    Used only for CT-MRI where adaptive contrast and sharpening improve
+    structural detail in soft tissue and bone edges.
+    """
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    enhanced = clahe.apply(fused_gray)
+    blur = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=1.0)
+    enhanced = cv2.addWeighted(enhanced, 1.5, blur, -0.5, 0)
+    ycbcr = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2YCrCb)
+    ycbcr[:, :, 0] = enhanced
+    for ch in (1, 2):
+        deviation = ycbcr[:, :, ch].astype(np.int16) - 128
+        ycbcr[:, :, ch] = np.clip(128 + deviation * 1.30, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(ycbcr, cv2.COLOR_YCrCb2BGR)
 
 
 def save_comparison_panel(source1, source2, fused, labels, path, msfd_guidance=None):
@@ -145,7 +222,7 @@ def generate_split(generator, dataset, output_root, labels, checkpoint_path, arg
     rows = []
     written = 0
     color_written = 0
-    bar = tqdm(loader, desc=f"Generate {args.pair} {args.split}", leave=False, dynamic_ncols=True, file=sys.stdout, ascii=False)
+    bar = tqdm(loader, desc=f"Generate {args.pair} {args.split}", leave=False, dynamic_ncols=True, file=sys.stdout, ascii=True)
     for batch in bar:
         source1 = batch["source1"].to(device)
         source2 = batch["source2"].to(device)
@@ -161,6 +238,11 @@ def generate_split(generator, dataset, output_root, labels, checkpoint_path, arg
             panel_path = panel_dir / f"{stem}_comparison.png"
             msfd_preview_path = ""
             fused_gray = tensor_to_uint8(fused[batch_index])
+            # Remove isolated noise dots (common in PET/SPECT) without blurring edges.
+            # d=7 / sigmaColor=20 / sigmaSpace=12 gives cleaner input for the
+            # CLAHE + unsharp-mask that follows in colorize_fused_pet_spect.
+            if args.pair in {"pet_mri", "spect_mri"}:
+                fused_gray = cv2.bilateralFilter(fused_gray, d=5, sigmaColor=30, sigmaSpace=8)
             save_uint8_image(fused_gray, fused_path)
             if msfd_guidance is not None:
                 msfd_preview_path = msfd_preview_dir / f"{stem}_msfd_guidance.png"
@@ -176,14 +258,21 @@ def generate_split(generator, dataset, output_root, labels, checkpoint_path, arg
             color_path = ""
             color_panel_path = ""
             if supports_color_visualization:
+                mri_u8 = tensor_to_uint8(source2[batch_index])
                 source1_color = read_source_color(batch["source1_path"][batch_index], fused_gray.shape)
                 if source1_color is not None:
-                    fused_color = colorize_fused_from_source(source1_color, fused_gray)
-                    color_path = color_dir / f"{stem}_fused.png"
-                    color_panel_path = color_panel_dir / f"{stem}_comparison.png"
-                    save_uint8_image(fused_color, color_path)
-                    save_color_comparison_panel(source1_color, source2[batch_index], fused_color, labels, color_panel_path)
-                    color_written += 1
+                    fused_color = ycrcb_colorize(source1_color, mri_u8)
+                else:
+                    fused_color = adafuse_colorize(
+                        tensor_to_uint8(source1[batch_index]),
+                        mri_u8,
+                    )
+                color_path = color_dir / f"{stem}_fused.png"
+                color_panel_path = color_panel_dir / f"{stem}_comparison.png"
+                save_uint8_image(fused_color, color_path)
+                panel_source1 = source1_color if source1_color is not None else cv2.cvtColor(tensor_to_uint8(source1[batch_index]), cv2.COLOR_GRAY2BGR)
+                save_color_comparison_panel(panel_source1, source2[batch_index], fused_color, labels, color_panel_path)
+                color_written += 1
             rows.append(
                 {
                     "index": written,

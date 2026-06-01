@@ -1,5 +1,6 @@
 from pathlib import Path
 import csv
+import gc
 import json
 import math
 import os
@@ -202,7 +203,7 @@ class GANFusionTrainer:
         discriminator_update_interval=2,
         lambda_intensity=1.0,
         lambda_gradient=5.0,
-        lambda_ssim=2.0,
+        lambda_ssim=0.0,   # stored but not applied in MedicalFusionGANLoss.forward() — SSIM removed
         lambda_texture=3.0,
         lambda_gan=0.1,
         use_msfd_guidance=True,
@@ -217,7 +218,7 @@ class GANFusionTrainer:
         lambda_mri_texture=None,
         val_split=0.15,
         val_every=1,
-        patience=20,
+        patience=0,
         min_delta=1e-4,
         num_workers=0,
         device=None,
@@ -262,9 +263,24 @@ class GANFusionTrainer:
         self.discriminator_update_interval = discriminator_update_interval
         self.use_msfd_guidance = bool(use_msfd_guidance)
         self.lambda_msfd = float(lambda_msfd)
+        if pair in {"pet_mri", "spect_mri"} and self.lambda_msfd > 0.5:
+            monitor_write(
+                f"[WARNING] lambda_msfd={self.lambda_msfd:.2f} is high for {pair}. "
+                "MSFD averages PET/SPECT+MRI which destroys sparse hotspot signal. "
+                "Recommended: --lambda-msfd <= 0.25"
+            )
         self.device = resolve_training_device(device, allow_cpu=allow_cpu)
         if self.device.startswith("cuda"):
             torch.backends.cudnn.benchmark = True
+            # Cap PyTorch VRAM usage to 90 % of total GPU memory.  This reserves
+            # a buffer so PyTorch raises an OOM *exception* before the GPU driver
+            # runs completely out of memory and triggers a Windows kernel crash
+            # (SYSTEM_SERVICE_EXCEPTION 0x3B BSOD with nvlddmkm.sys).
+            try:
+                torch.cuda.set_per_process_memory_fraction(0.90)
+                monitor_write("[VRAM Guard] PyTorch VRAM capped at 90% of total GPU memory to prevent driver BSOD.")
+            except Exception as _mem_exc:
+                monitor_write(f"[VRAM Guard] Could not set memory fraction: {_mem_exc}")
         monitor_write(f"[Device] Selected runtime device: {describe_training_device(self.device)}")
         self.history = []
         self.requested_batch_size = batch_size
@@ -299,7 +315,9 @@ class GANFusionTrainer:
 
         loader_kwargs = {
             "num_workers": num_workers,
-            "pin_memory": self.device.startswith("cuda"),
+            # pin_memory=False avoids Windows file-descriptor exhaustion and
+            # memory pressure that caused DataLoader crashes after epoch ~60.
+            "pin_memory": False,
         }
 
         if num_workers > 0:
@@ -327,25 +345,34 @@ class GANFusionTrainer:
         self.discriminator2 = PatchDiscriminator(in_channels=1).to(self.device)
 
         if self.pair == "ct_mri":
+            # CT-MRI: bone edges from CT + soft tissue from MRI.
+            # Reduce gradient weight so MRI structural content is preserved;
+            # strong MRI preservation improves PSNR, MI, and FMI.
             if lambda_gradient == 5.0:
-                lambda_gradient = 3.5
+                lambda_gradient = 2.0          # was 3.5 → lower to reduce over-sharpening
+            # lambda_ssim is stored but never applied in MedicalFusionGANLoss.forward(); no override needed.
             lambda_source1_intensity = 0.0 if lambda_source1_intensity is None else lambda_source1_intensity
             lambda_source1_gradient = 0.0 if lambda_source1_gradient is None else lambda_source1_gradient
             lambda_source1_ssim = 0.0 if lambda_source1_ssim is None else lambda_source1_ssim
             lambda_source1_texture = 0.0 if lambda_source1_texture is None else lambda_source1_texture
             lambda_source1_hot = 0.0 if lambda_source1_hot is None else lambda_source1_hot
-            lambda_mri_intensity = 0.45 if lambda_mri_intensity is None else lambda_mri_intensity
-            lambda_mri_ssim = 0.75 if lambda_mri_ssim is None else lambda_mri_ssim
-            lambda_mri_texture = 0.45 if lambda_mri_texture is None else lambda_mri_texture
+            lambda_mri_intensity = 1.5 if lambda_mri_intensity is None else lambda_mri_intensity   # was 0.45
+            lambda_mri_ssim = 1.5 if lambda_mri_ssim is None else lambda_mri_ssim                  # was 0.75
+            lambda_mri_texture = 0.8 if lambda_mri_texture is None else lambda_mri_texture         # was 0.45
         elif self.pair in {"pet_mri", "spect_mri"}:
-            lambda_source1_intensity = 1.0 if lambda_source1_intensity is None else lambda_source1_intensity
-            lambda_source1_gradient = 3.0 if lambda_source1_gradient is None else lambda_source1_gradient
-            lambda_source1_ssim = 0.8 if lambda_source1_ssim is None else lambda_source1_ssim
-            lambda_source1_texture = 2.2 if lambda_source1_texture is None else lambda_source1_texture
-            lambda_source1_hot = 2.0 if lambda_source1_hot is None else lambda_source1_hot
-            lambda_mri_intensity = 0.15 if lambda_mri_intensity is None else lambda_mri_intensity
-            lambda_mri_ssim = 0.25 if lambda_mri_ssim is None else lambda_mri_ssim
-            lambda_mri_texture = 0.15 if lambda_mri_texture is None else lambda_mri_texture
+            # PET/SPECT-MRI: functional hotspot intensity from PET/SPECT + anatomy from MRI.
+            # Higher source1 (PET/SPECT) weights drive MI and FMI; moderate MRI preservation.
+            if lambda_gradient == 5.0:
+                lambda_gradient = 2.5
+            # lambda_ssim is stored but never applied in MedicalFusionGANLoss.forward(); no override needed.
+            lambda_source1_intensity = 2.0 if lambda_source1_intensity is None else lambda_source1_intensity  # was 1.5
+            lambda_source1_gradient = 3.5 if lambda_source1_gradient is None else lambda_source1_gradient  # was 3.0
+            lambda_source1_ssim = 1.0 if lambda_source1_ssim is None else lambda_source1_ssim                 # was 0.8
+            lambda_source1_texture = 2.5 if lambda_source1_texture is None else lambda_source1_texture        # was 2.2
+            lambda_source1_hot = 5.0 if lambda_source1_hot is None else lambda_source1_hot                    # was 2.5
+            lambda_mri_intensity = 0.6 if lambda_mri_intensity is None else lambda_mri_intensity              # was 0.15
+            lambda_mri_ssim = 0.8 if lambda_mri_ssim is None else lambda_mri_ssim                             # was 0.25
+            lambda_mri_texture = 0.5 if lambda_mri_texture is None else lambda_mri_texture                    # was 0.15
         else:
             lambda_source1_intensity = 0.0 if lambda_source1_intensity is None else lambda_source1_intensity
             lambda_source1_gradient = 0.0 if lambda_source1_gradient is None else lambda_source1_gradient
@@ -409,9 +436,13 @@ class GANFusionTrainer:
             f"ssim={lambda_mri_ssim:.2f}, texture={lambda_mri_texture:.2f}"
         )
 
-        self.load_history()
-        self.restore_best_from_history()
-
+        # Load checkpoint FIRST so start_epoch is correct before we restore
+        # best metrics from history.  If the checkpoint is loaded, start_epoch
+        # will be set to saved_epoch+1.  If no checkpoint is loaded (fresh
+        # start), start_epoch stays at 1 and restore_best_from_history() will
+        # find no prior epochs to restore from (all old history rows have
+        # epoch >= 1), so the new run starts with a clean best-metric slate and
+        # early-stopping is not prematurely triggered by a previous run's metrics.
         if resume and auto_resume:
             raise ValueError("Use either resume or auto_resume, not both.")
         if resume:
@@ -422,6 +453,9 @@ class GANFusionTrainer:
                 monitor_write(f"No checkpoint found in {self.checkpoint_dir}. Starting from scratch.")
             else:
                 self.load_checkpoint(latest_checkpoint)
+
+        self.load_history()
+        self.restore_best_from_history()
 
     def _ensure_output_dirs(self):
         for folder in [
@@ -446,12 +480,18 @@ class GANFusionTrainer:
                 except ValueError:
                     continue
                 checkpoints.append((epoch, path))
-        if not checkpoints:
-            old_latest = OLD_GAN_CHECKPOINT_DIR / "latest_checkpoint.pt"
-            if old_latest.exists():
-                return old_latest
-            return None
-        return max(checkpoints, key=lambda item: item[0])[1]
+        if checkpoints:
+            latest = max(checkpoints, key=lambda item: item[0])
+            monitor_write(f"[AutoResume] Resuming from last trained epoch checkpoint: {latest[1]} (epoch {latest[0]})")
+            return latest[1]
+        for folder in [self.checkpoint_dir, OLD_GAN_CHECKPOINT_DIR]:
+            if not folder.exists():
+                continue
+            latest_path = folder / "latest_checkpoint.pt"
+            if latest_path.exists():
+                monitor_write(f"[AutoResume] Resuming from latest_checkpoint.pt: {latest_path}")
+                return latest_path
+        return None
 
     def load_checkpoint(self, checkpoint_path):
         checkpoint_path = Path(checkpoint_path)
@@ -517,6 +557,41 @@ class GANFusionTrainer:
         self.start_epoch = 51
         monitor_write(f"Loaded old checkpoint from {checkpoint_path} and resumed from epoch {self.start_epoch}")
         monitor_write("Loaded generator weights only; optimizer restarted.")
+
+    def _recover_nan_weights(self):
+        """Reload model/optimizer state from best_checkpoint.pt without changing the epoch counter.
+
+        Called mid-fit() when NaN weights are detected (e.g. every batch was skipped in an epoch).
+        Returns True if recovery succeeded, False otherwise.
+        """
+        best_ckpt = self.checkpoint_dir / "best_checkpoint.pt"
+        if not best_ckpt.exists():
+            monitor_write(f"[NaN Recovery] No best_checkpoint.pt at {best_ckpt}. Cannot recover.")
+            return False
+        try:
+            ckpt = torch.load(best_ckpt, map_location=self.device)
+            self.generator.load_state_dict(ckpt["generator"])
+            self.discriminator1.load_state_dict(ckpt["discriminator1"])
+            self.discriminator2.load_state_dict(ckpt["discriminator2"])
+            self.optimizer_g.load_state_dict(ckpt["optimizer_g"])
+            self.optimizer_d1.load_state_dict(ckpt["optimizer_d1"])
+            self.optimizer_d2.load_state_dict(ckpt["optimizer_d2"])
+            if "scaler" in ckpt:
+                self.scaler.load_state_dict(ckpt["scaler"])
+            # Reset AMP scaler to avoid stale scale factor after NaN collapse
+            self.scaler = GradScaler("cuda", enabled=self.amp_enabled)
+            self.zero_all_gradients()
+            gc.collect()
+            if self.device.startswith("cuda"):
+                torch.cuda.empty_cache()
+            monitor_write(
+                f"[NaN Recovery] Reloaded model/optimizer from best_checkpoint.pt "
+                f"(saved at epoch {ckpt.get('epoch', '?')}). Continuing training."
+            )
+            return True
+        except Exception as exc:
+            monitor_write(f"[NaN Recovery] Failed to load best_checkpoint.pt: {exc}")
+            return False
 
     @staticmethod
     def _set_optimizer_lr(optimizer, lr):
@@ -689,17 +764,20 @@ class GANFusionTrainer:
     def _metrics_from_fused(self, fused, mri, ct):
         metrics = evaluate_fusion(fused, mri, ct)
         return {
-            "psnr": _avg_source_metric(metrics, "PSNR_MRI", "PSNR_CT"),
-            "ssim": _avg_source_metric(metrics, "SSIM_MRI", "SSIM_CT"),
-            "sf": metrics.get("SF", 0.0),
-            "mi": _avg_source_metric(metrics, "MI_MRI", "MI_CT"),
-            "ag": metrics.get("AG", 0.0),
-            "fmi": metrics.get("FMI", 0.0),
-            "en": metrics.get("EN", 0.0),
-            "cc": metrics.get("CC", 0.0),
-            "epi": metrics.get("EPI", 0.0),
+            # Use the aggregated convenience keys from evaluate_fusion:
+            #   PSNR  → avg(PSNR_MRI, PSNR_CT) with data_range=1.0 (images in [0,1])
+            #   MI    → MI_MRI + MI_CT (sum, 256 bins) to match paper convention
+            "psnr": metrics.get("PSNR", _avg_source_metric(metrics, "PSNR_MRI", "PSNR_CT")),
+            "ssim": metrics.get("SSIM", _avg_source_metric(metrics, "SSIM_MRI", "SSIM_CT")),
+            "sf":   metrics.get("SF", 0.0),
+            "mi":   metrics.get("MI", 0.0),   # sum MI_MRI + MI_CT
+            "ag":   metrics.get("AG", 0.0),
+            "fmi":  metrics.get("FMI", 0.0),
+            "en":   metrics.get("EN", 0.0),
+            "cc":   metrics.get("CC", 0.0),
+            "epi":  metrics.get("EPI", 0.0),
             "noise": metrics.get("NOISE", 0.0),
-            "ms": _avg_source_metric(metrics, "MS_MRI", "MS_CT"),
+            "ms":   _avg_source_metric(metrics, "MS_MRI", "MS_CT"),
         }
 
     def train_epoch(self, epoch):
@@ -753,7 +831,21 @@ class GANFusionTrainer:
             bar_format=TQDM_BAR_FORMAT,
             mininterval=0.5,
         )
-        for batch_index, batch in enumerate(bar, start=1):
+        loader_iter = iter(bar)
+        batch_index = 0
+        while True:
+            try:
+                batch = next(loader_iter)
+            except StopIteration:
+                break
+            except Exception as dl_exc:
+                skipped_batches += 1
+                monitor_write(
+                    f"[DataLoader ERROR] epoch {epoch}, batch ~{batch_index + 1}: "
+                    f"{type(dl_exc).__name__}: {dl_exc} — skipping batch"
+                )
+                continue
+            batch_index += 1
             ct = batch["ct"].to(self.device)
             mri = batch["mri"].to(self.device)
 
@@ -960,6 +1052,14 @@ class GANFusionTrainer:
             "ms": 0.0,
         }
 
+        # Free training-pass memory before running validation so the GPU has
+        # maximum headroom.  This also prevents the driver-level VRAM exhaustion
+        # (SYSTEM_SERVICE_EXCEPTION 0x3B BSOD) from building up across the epoch.
+        gc.collect()
+        if self.device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+        processed_count = 0  # tracks batches that actually contributed to totals
         bar = tqdm(
             self.val_loader,
             desc=f"Validate {epoch}/{self.epochs}",
@@ -972,20 +1072,37 @@ class GANFusionTrainer:
             mininterval=0.5,
         )
         for index, batch in enumerate(bar):
-            ct = batch["ct"].to(self.device)
-            mri = batch["mri"].to(self.device)
+            try:
+                ct = batch["ct"].to(self.device)
+                mri = batch["mri"].to(self.device)
+            except Exception as load_exc:
+                monitor_write(
+                    f"[Val DataLoader ERROR] epoch {epoch}, batch {index + 1}: "
+                    f"{type(load_exc).__name__}: {load_exc} — skipping batch"
+                )
+                continue
             if not self.is_finite(ct, "validation input ct", epoch, index + 1) or not self.is_finite(mri, "validation input mri", epoch, index + 1):
                 continue
-            with autocast("cuda", enabled=self.amp_enabled):
-                fused, pre_val, post_val = self.generator.forward_with_debug(ct.float(), mri.float())
-            self.is_finite(pre_val, "validation generator output before final activation", epoch, index + 1)
-            self.is_finite(post_val, "validation generator output after final activation", epoch, index + 1)
-            fused, fused_ok = self.safe_fused(fused, "validation fused output", epoch, index + 1)
-            if not fused_ok:
+            try:
+                with autocast("cuda", enabled=self.amp_enabled):
+                    fused, pre_val, post_val = self.generator.forward_with_debug(ct.float(), mri.float())
+                self.is_finite(pre_val, "validation generator output before final activation", epoch, index + 1)
+                self.is_finite(post_val, "validation generator output after final activation", epoch, index + 1)
+                fused, fused_ok = self.safe_fused(fused, "validation fused output", epoch, index + 1)
+                if not fused_ok:
+                    continue
+                with autocast("cuda", enabled=self.amp_enabled):
+                    g_losses = self._generator_loss_parts(fused.float(), ct.float(), mri.float())
+                    d1_loss, d2_loss = self._discriminator_losses(fused.float(), ct.float(), mri.float(), deterministic=True)
+            except torch.cuda.OutOfMemoryError:
+                monitor_write(
+                    f"[Val CUDA OOM] epoch {epoch}, batch {index + 1}: "
+                    "CUDA out of memory during validation — skipping batch. "
+                    "Consider reducing --micro-batch."
+                )
+                gc.collect()
+                torch.cuda.empty_cache()
                 continue
-            with autocast("cuda", enabled=self.amp_enabled):
-                g_losses = self._generator_loss_parts(fused.float(), ct.float(), mri.float())
-                d1_loss, d2_loss = self._discriminator_losses(fused.float(), ct.float(), mri.float(), deterministic=True)
             if (
                 not self.is_finite(g_losses["total"], "validation generator total loss", epoch, index + 1)
                 or not self.is_finite(d1_loss, "validation discriminator1 loss", epoch, index + 1)
@@ -1007,15 +1124,29 @@ class GANFusionTrainer:
             for key, value in metric_values.items():
                 totals[key] += value
 
+            processed_count += 1  # only count batches that fully succeeded
+
             if index < 4:
                 original_path = self.original_sample_dir / f"epoch_{epoch:03d}_sample_{index + 1:02d}.png"
                 comparison_path = self.comparison_sample_dir / f"epoch_{epoch:03d}_sample_{index + 1:02d}_{self.pair}_comparison.png"
                 _save_tensor_image(fused[0], original_path)
                 _save_validation_comparison(ct[0], mri[0], fused[0], comparison_path, pair_labels(self.pair))
 
-            bar.set_postfix(loss=f"{totals['total_loss'] / (index + 1):.4f}")
+            bar.set_postfix(loss=f"{totals['total_loss'] / processed_count:.4f}")
 
-        count = max(1, len(self.val_loader))
+        if processed_count == 0:
+            monitor_write(
+                f"[Val WARNING] epoch {epoch}: validation loop processed 0 batches — "
+                "all batches were skipped or the val_loader is empty. "
+                "Metrics will be reported as None (not 0.0) to avoid corrupting best-checkpoint selection."
+            )
+            return {}
+
+        # Divide by the number of batches that actually contributed data.
+        # Previously used len(val_loader) which caused all metrics to silently
+        # collapse to 0.0 when the loader returned no data (e.g. after a BSOD
+        # restart left the dataset in a broken state).
+        count = processed_count
         return {key: value / count for key, value in totals.items()}
 
     def save_checkpoint(self, epoch):
@@ -1090,7 +1221,14 @@ class GANFusionTrainer:
     def restore_best_from_history(self):
         if not self.history:
             return
-        for row in self.history:
+        # Only consider epochs that belong to this training session, i.e.
+        # epochs that have already been completed (epoch < start_epoch).
+        # This prevents a fresh-start run (start_epoch=1) from inheriting the
+        # best-epoch bookkeeping of a previous training run stored in the same
+        # history file, which would cause early-stopping to fire immediately
+        # because the new run's early SSIM can never beat the old run's peak.
+        relevant = [row for row in self.history if int(row["epoch"]) < self.start_epoch]
+        for row in relevant:
             val_ssim = self.metric_or_default(row.get("val_ssim"), float("-inf"))
             val_fmi = self.metric_or_default(row.get("val_fmi"), float("-inf"))
             val_psnr = self.metric_or_default(row.get("val_psnr"), float("-inf"))
@@ -1394,6 +1532,25 @@ class GANFusionTrainer:
 
             if should_validate:
                 self.step_lr_schedulers(val_loss)
+                # Discriminator stabilisation: when the generator stagnates,
+                # progressively reduce D LR so the discriminator cannot
+                # overpower it further (addresses the SSIM collapse seen after
+                # the best epoch in all 3 GAN pairs).
+                if is_best:
+                    # New best: restore D LR to its original ratio vs G LR.
+                    new_d_lr = self.optimizer_g.param_groups[0]["lr"] * (self.lr_d / max(self.lr_g, 1e-12))
+                    self._set_optimizer_lr(self.optimizer_d1, max(new_d_lr, 1e-7))
+                    self._set_optimizer_lr(self.optimizer_d2, max(new_d_lr, 1e-7))
+                elif self.no_improve_epochs > 0 and self.no_improve_epochs % 5 == 0:
+                    # Every 5 stagnation epochs, halve D LR (floor 1e-7).
+                    for opt in (self.optimizer_d1, self.optimizer_d2):
+                        for group in opt.param_groups:
+                            group["lr"] = max(group["lr"] * 0.5, 1e-7)
+                    lrs = self.current_lrs()
+                    monitor_write(
+                        f"[D-Stabilise] no_improve={self.no_improve_epochs} → "
+                        f"D1 LR={lrs['d1']:.2e}, D2 LR={lrs['d2']:.2e}"
+                    )
 
             checkpoint_path = self.save_checkpoint(epoch)
             row = self.build_history_row(epoch, train_values, val_values, is_best)
@@ -1417,6 +1574,33 @@ class GANFusionTrainer:
                 f"best_epoch={self.best_epoch} | checkpoint=saved"
             )
             self.append_training_log(epoch, train_values, val_values, checkpoint_path, is_best)
+
+            # Memory cleanup every epoch to prevent CUDA fragmentation and
+            # Windows file-descriptor exhaustion over long multi-epoch runs.
+            gc.collect()
+            if self.device.startswith("cuda"):
+                torch.cuda.empty_cache()
+
+            # NaN recovery: if every batch in this epoch was skipped it means
+            # the generator weights have collapsed to NaN/Inf.  Reload the
+            # best checkpoint so training can continue from a known-good state.
+            _total_batches = len(self.train_loader)
+            _skipped = int(train_values.get("skipped_batches", 0))
+            if _total_batches > 0 and _skipped >= _total_batches:
+                monitor_write(
+                    f"[NaN Recovery] Epoch {epoch}: all {_skipped}/{_total_batches} batches were skipped. "
+                    "Inspecting generator for NaN/Inf weights..."
+                )
+                _nan_params = sum(
+                    1 for p in self.generator.parameters()
+                    if not torch.isfinite(p).all()
+                )
+                if _nan_params > 0:
+                    monitor_write(f"[NaN Recovery] Found {_nan_params} NaN/Inf parameter tensors. Attempting recovery...")
+                    self._recover_nan_weights()
+                else:
+                    monitor_write("[NaN Recovery] Generator weights look finite — skips may have been data/loss NaNs only.")
+
             if should_validate and self.patience > 0 and self.no_improve_epochs >= self.patience:
                 monitor_write(f"Early stopping: no validation SSIM/loss improvement for {self.no_improve_epochs} epochs.")
                 return False

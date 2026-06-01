@@ -44,9 +44,14 @@ def parse_args():
     parser.add_argument("--pair", choices=["ct_mri", "pet_mri", "spect_mri"], default="ct_mri")
     parser.add_argument("--output-dir", default=None, help="Optional experiment folder. Default: outputs/models/gan/aanlib_<pair>.")
     parser.add_argument("--image-size", type=int, default=256)
-    parser.add_argument("--batch-size", type=int, default=204)
+    parser.add_argument("--batch-size", type=int, default=8,
+                        help="Effective batch size. Keep ≤ dataset size so accumulation steps "
+                             "< number of batches per epoch (avoids 1-step-per-epoch bug). "
+                             "Default: 8 (2 accumulation steps of micro-batch 4).")
     parser.add_argument("--micro-batch", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=150,
+                        help="Number of training epochs. Increased from 50 to 150 to allow "
+                             "the model to converge properly with the fixed batch size.")
     parser.add_argument("--device", default="auto", help="auto, cuda, cuda:0, or cpu.")
     parser.add_argument("--allow-cpu", action="store_true")
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -54,16 +59,19 @@ def parse_args():
     parser.add_argument("--discriminator-update-interval", type=int, default=2)
     parser.add_argument("--lambda-intensity", type=float, default=1.0)
     parser.add_argument("--lambda-gradient", type=float, default=5.0)
-    parser.add_argument("--lambda-ssim", type=float, default=2.0)
+    parser.add_argument("--lambda-ssim", type=float, default=0.0)  # disabled – not used in MedicalFusionGANLoss.forward()
     parser.add_argument("--lambda-texture", type=float, default=3.0)
     parser.add_argument("--lambda-gan", type=float, default=0.1)
     parser.add_argument("--use-msfd-guidance", dest="use_msfd_guidance", action="store_true", default=True, help="Use MSFD guidance L1 loss during generator training. Enabled by default.")
     parser.add_argument("--no-msfd-guidance", dest="use_msfd_guidance", action="store_false", help="Disable MSFD guidance and use the old normal GAN training objective.")
-    parser.add_argument("--lambda-msfd", type=float, default=1.0, help="Weight for MSFD guidance L1 loss.")
+    parser.add_argument("--lambda-msfd", type=float, default=0.25, help="Weight for MSFD guidance L1 loss.")
     parser.add_argument("--lambda-grad", type=float, default=None, help="Deprecated alias for --lambda-gradient.")
     parser.add_argument("--val-split", type=float, default=0.15, help="Deterministic internal validation split when AANLIB/<pair>/val is absent.")
     parser.add_argument("--val-every", type=int, default=1)
-    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--patience", type=int, default=0,
+                        help="Early-stopping patience in epochs. 0 (default) disables early stopping so training "
+                             "always runs for the full --epochs count. Set to a positive value (e.g. 35) to stop "
+                             "early when validation SSIM/loss stops improving.")
     parser.add_argument("--min-delta", type=float, default=1e-4)
     parser.add_argument("--lambda-source1-intensity", type=float, default=None)
     parser.add_argument("--lambda-source1-gradient", type=float, default=None)

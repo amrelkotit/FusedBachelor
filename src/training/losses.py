@@ -4,11 +4,12 @@ import torch.nn.functional as F
 
 
 def sobel_edges(image):
-    """Sobel edge magnitude for grayscale tensors shaped (B, 1, H, W)."""
-    kernel_x = image.new_tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]).view(1, 1, 3, 3)
-    kernel_y = image.new_tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]]).view(1, 1, 3, 3)
-    grad_x = F.conv2d(image, kernel_x, padding=1)
-    grad_y = F.conv2d(image, kernel_y, padding=1)
+    """Sobel edge magnitude — works for any number of channels (B, C, H, W)."""
+    C = image.shape[1]
+    kernel_x = image.new_tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]).view(1, 1, 3, 3).repeat(C, 1, 1, 1)
+    kernel_y = image.new_tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]]).view(1, 1, 3, 3).repeat(C, 1, 1, 1)
+    grad_x = F.conv2d(image, kernel_x, padding=1, groups=C)
+    grad_y = F.conv2d(image, kernel_y, padding=1, groups=C)
     return torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-8)
 
 
@@ -170,7 +171,7 @@ class MedicalFusionGANLoss(nn.Module):
         self,
         lambda_intensity=1.0,
         lambda_gradient=5.0,
-        lambda_ssim=2.0,
+        lambda_ssim=0.0,              # disabled – SSIM removed from training loss
         lambda_texture=3.0,
         lambda_gan=0.1,
         lambda_source1_intensity=0.0,
@@ -200,7 +201,6 @@ class MedicalFusionGANLoss(nn.Module):
     def forward(self, fused, mri, ct, d1_fake_logits, d2_fake_logits):
         intensity = intensity_loss(fused, mri, ct)
         grad = gradient_loss(fused, mri, ct)
-        ssim = structural_loss(fused, mri, ct)
         texture = texture_loss(fused, mri, ct)
         src1_intensity, src1_grad, src1_ssim, src1_texture, src1_hot = source1_preservation_loss(fused, ct)
         mri_intensity, mri_ssim, mri_texture = mri_preservation_loss(fused, mri)
@@ -208,7 +208,6 @@ class MedicalFusionGANLoss(nn.Module):
         total = (
             self.lambda_intensity * intensity
             + self.lambda_gradient * grad
-            + self.lambda_ssim * ssim
             + self.lambda_texture * texture
             + self.lambda_source1_intensity * src1_intensity
             + self.lambda_source1_gradient * src1_grad
@@ -220,14 +219,16 @@ class MedicalFusionGANLoss(nn.Module):
             + self.lambda_mri_texture * mri_texture
             + self.lambda_gan * gan
         )
+        zero = total.new_tensor(0.0)
         return {
             "total": total,
-            "fusion": (intensity + grad + ssim + texture).detach(),
+            "fusion": (intensity + grad + texture).detach(),
             "intensity": intensity.detach(),
             "gradient": grad.detach(),
-            "ssim": ssim.detach(),
+            "ssim": zero.detach(),       # removed from training loss; kept as zero for trainer compat
             "texture": texture.detach(),
             "gan": gan.detach(),
+            "msfd": zero.detach(),       # removed from training loss; kept as zero for trainer compat
         }
 
 

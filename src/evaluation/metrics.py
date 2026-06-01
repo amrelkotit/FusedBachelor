@@ -19,12 +19,27 @@ def _as_bchw(image):
 
 
 def psnr(image, reference, data_range=1.0):
-    image = _as_bchw(image)
+    """
+    Peak Signal-to-Noise Ratio.
+
+    Standard formula:  PSNR = 10 * log10(data_range^2 / MSE)
+
+    Convention (data_range=1.0):
+      Images are normalised to [0,1] before MSE is computed.
+      Typical values for good medical-image fusion: 20–35 dB.
+
+    ⚠️  Historical note: earlier versions of this codebase used data_range=255
+    even though images were already normalised to [0,1].  This inflated PSNR
+    by 20·log10(255) ≈ 48.13 dB (yielding values in the 60–70 dB range).
+    That convention is non-standard and has been corrected here.
+    Pass data_range=255.0 explicitly if you need the old inflated values.
+    """
+    image     = _as_bchw(image)
     reference = _as_bchw(reference).to(image.device)
-    mse = F.mse_loss(image, reference)
+    mse       = F.mse_loss(image, reference)
     if mse.item() == 0:
         return float("inf")
-    return 20.0 * math.log10(data_range) - 10.0 * math.log10(mse.item())
+    return 20.0 * math.log10(float(data_range)) - 10.0 * math.log10(mse.item())
 
 
 def ssim(image, reference, data_range=1.0, window_size=7):
@@ -65,7 +80,7 @@ def average_gradient(image):
     return torch.mean(torch.sqrt((dx.pow(2) + dy.pow(2)) * 0.5 + 1e-8)).item()
 
 
-def mutual_information(image, reference, bins=64):
+def mutual_information(image, reference, bins=256):
     image = _as_bchw(image).detach().flatten().clamp(0.0, 1.0)
     reference = _as_bchw(reference).to(image.device).detach().flatten().clamp(0.0, 1.0)
     if image.numel() == 0 or reference.numel() == 0:
@@ -130,7 +145,7 @@ def _feature_normalize(feature, eps=1e-8):
     return normalized
 
 
-def _normalized_mutual_information(image, reference, bins=64, eps=1e-12):
+def _normalized_mutual_information(image, reference, bins=256, eps=1e-12):
     image = _as_bchw(image).detach().flatten().clamp(0.0, 1.0)
     reference = _as_bchw(reference).to(image.device).detach().flatten().clamp(0.0, 1.0)
     if image.numel() == 0 or reference.numel() == 0:
@@ -160,8 +175,8 @@ def feature_mutual_information(fused, source1, source2):
     source1_grad = _feature_normalize(_gradient_magnitude(_as_bchw(source1).to(fused_grad.device)))
     source2_grad = _feature_normalize(_gradient_magnitude(_as_bchw(source2).to(fused_grad.device)))
     value = 0.5 * (
-        _normalized_mutual_information(fused_grad, source1_grad, bins=64)
-        + _normalized_mutual_information(fused_grad, source2_grad, bins=64)
+        _normalized_mutual_information(fused_grad, source1_grad, bins=256)
+        + _normalized_mutual_information(fused_grad, source2_grad, bins=256)
     )
     return value if math.isfinite(value) else 0.0
 
@@ -194,23 +209,45 @@ def multi_scale_ssim(image, reference, levels=3):
 
 
 def evaluate_fusion(fused, mri, ct):
-    """Return no-reference and source-reference metrics for one fused image."""
+    """Return no-reference and source-reference metrics for one fused image.
+
+    Aggregated convenience keys (used by test.py, trainer, and figure scripts):
+      PSNR  – average of PSNR_MRI and PSNR_CT  (data_range=1.0 — images are
+               normalised to [0,1] before MSE; typical values 15–35 dB)
+      SSIM  – average of SSIM_MRI and SSIM_CT
+      MI    – *sum* of MI_MRI + MI_CT  (256-bin histograms), matching the
+               total mutual-information convention used in the comparison paper
+    """
     fused = _as_bchw(fused)
     mri = _as_bchw(mri).to(fused.device)
     ct = _as_bchw(ct).to(fused.device)
 
-    avg_reference = 0.5 * (mri + ct)
+    psnr_mri = psnr(fused, mri, data_range=1.0)
+    psnr_ct  = psnr(fused, ct,  data_range=1.0)
+    ssim_mri = ssim(fused, mri)
+    ssim_ct  = ssim(fused, ct)
+    mi_mri   = mutual_information(fused, mri)
+    mi_ct    = mutual_information(fused, ct)
+    cc_mri   = correlation_coefficient(fused, mri)
+    cc_ct    = correlation_coefficient(fused, ct)
+
     return {
-        "PSNR_MRI": psnr(fused, mri),
-        "PSNR_CT": psnr(fused, ct),
-        "SSIM_MRI": ssim(fused, mri),
-        "SSIM_CT": ssim(fused, ct),
-        "MI_MRI": mutual_information(fused, mri),
-        "MI_CT": mutual_information(fused, ct),
+        # --- per-source keys (raw, for diagnostics) ---
+        "PSNR_MRI": psnr_mri,
+        "PSNR_CT":  psnr_ct,
+        "SSIM_MRI": ssim_mri,
+        "SSIM_CT":  ssim_ct,
+        "MI_MRI":   mi_mri,
+        "MI_CT":    mi_ct,
+        # --- aggregated keys (used in thesis tables) ---
+        "PSNR": 0.5 * (psnr_mri + psnr_ct),
+        "SSIM": 0.5 * (ssim_mri + ssim_ct),
+        "MI":   mi_mri + mi_ct,          # sum, NOT average
+        # --- other metrics ---
         "EN": entropy(fused),
-        "CC_MRI": correlation_coefficient(fused, mri),
-        "CC_CT": correlation_coefficient(fused, ct),
-        "CC": correlation_coefficient(fused, avg_reference),
+        "CC_MRI": cc_mri,
+        "CC_CT":  cc_ct,
+        "CC":     (cc_mri + cc_ct) / 2.0,
         "FMI": feature_mutual_information(fused, mri, ct),
         "SF": spatial_frequency(fused),
         "AG": average_gradient(fused),

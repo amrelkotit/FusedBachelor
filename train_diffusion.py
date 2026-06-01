@@ -16,6 +16,10 @@ def force_utf8_console():
 
 
 os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
+# Reduce CUDA allocator fragmentation — prevents OOM after NaN-skipped batches
+# that leave many small reserved-but-unallocated blocks.  Must be set before
+# any CUDA tensor is created (i.e. before torch is imported at runtime).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*torch.cuda.amp.*")
 
 from src.data.paired_dataset import AANLIB_ROOT, aanlib_split_root, diffusion_checkpoint_dir, diffusion_graph_dir, diffusion_image_dir, diffusion_logs_dir, diffusion_metrics_dir, normalize_pair, verify_dataset_root
@@ -26,7 +30,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train an independent diffusion model for AANLIB medical image fusion.")
     parser.add_argument("--dataset-root", default=str(AANLIB_ROOT))
     parser.add_argument("--pair", choices=["ct_mri", "pet_mri", "spect_mri"], default="ct_mri")
-    parser.add_argument("--epochs", type=int, default=120)
+    parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--micro-batch", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -39,19 +43,23 @@ def parse_args():
     parser.add_argument("--timesteps", type=int, default=1000)
     parser.add_argument("--sampling-steps", type=int, default=150)
     parser.add_argument("--image-size", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--lambda-noise", type=float, default=1.2)
-    parser.add_argument("--lambda-l1", type=float, default=1.2)
-    parser.add_argument("--lambda-ssim", type=float, default=2.5)
-    parser.add_argument("--lambda-grad", type=float, default=1.6)
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--base-channels", type=int, default=64)
+    parser.add_argument("--time-dim", type=int, default=256)
+    parser.add_argument("--lambda-noise", type=float, default=0.5)
+    parser.add_argument("--lambda-l1", type=float, default=2.0)
+    parser.add_argument("--lambda-ssim", type=float, default=0.0)
+    parser.add_argument("--lambda-grad", type=float, default=2.0)
     parser.add_argument("--lambda-hf", type=float, default=1.0)
-    parser.add_argument("--lambda-ms-ssim", type=float, default=0.8)
-    parser.add_argument("--lambda-local-contrast", type=float, default=0.4)
+    parser.add_argument("--lambda-ms-ssim", type=float, default=0.0)
+    parser.add_argument("--lambda-local-contrast", type=float, default=0.3)
+    parser.add_argument("--lambda-perceptual", type=float, default=0.0,
+                        help="Perceptual loss weight. Disabled (0) by default — VGG uses torch.no_grad so gradients are zero; enabling it only adds constant noise to the loss value.")
     parser.add_argument("--use-ema", dest="use_ema", action="store_true", default=True)
     parser.add_argument("--no-use-ema", dest="use_ema", action="store_false")
     parser.add_argument("--ema-decay", type=float, default=0.999)
-    parser.add_argument("--early-stopping", action="store_true")
-    parser.add_argument("--patience", type=int, default=30)
+    parser.add_argument("--no-early-stopping", dest="early_stopping", action="store_false", default=True)
+    parser.add_argument("--patience", type=int, default=40)
     parser.add_argument("--min-delta", type=float, default=0.0005)
     parser.add_argument("--val-split", type=float, default=0.15)
     parser.add_argument("--max-items", type=int, default=None)
@@ -96,7 +104,10 @@ def main():
         lambda_noise=args.lambda_noise,
         lambda_ms_ssim=args.lambda_ms_ssim,
         lambda_local_contrast=args.lambda_local_contrast,
+        lambda_perceptual=args.lambda_perceptual,
         lambda_msfd=args.lambda_msfd,
+        base_channels=args.base_channels,
+        time_dim=args.time_dim,
         use_msfd_guidance=args.use_msfd_guidance,
         use_ema=args.use_ema,
         ema_decay=args.ema_decay,

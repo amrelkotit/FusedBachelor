@@ -5,6 +5,17 @@ import cv2
 import torch
 from torch.utils.data import ConcatDataset, Dataset, random_split
 
+try:
+    import torchvision.transforms.functional as TF
+    try:
+        from torchvision.transforms import InterpolationMode as _IMode
+        _BILINEAR = _IMode.BILINEAR
+    except ImportError:
+        _BILINEAR = 2  # PIL.Image.BILINEAR integer fallback for older torchvision
+    _HAS_TF = True
+except ImportError:
+    _HAS_TF = False
+
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -276,7 +287,55 @@ class CombinedMedicalFusionDataset(ConcatDataset):
         super().__init__(datasets)
 
 
-def build_aanlib_train_val_datasets(dataset_root, pair, image_size=256, max_items=None, val_split=0.15, seed=42):
+class AugmentedPairedDataset(Dataset):
+    """Wraps a paired dataset and applies random paired augmentation.
+
+    Applied *only* at training time.  The same spatial transform is used for
+    both source modalities so spatial alignment is preserved.  Brightness
+    jitter is applied only to source1 (the non-MRI modality) to simulate
+    cross-modality intensity variation.
+
+    Requires torchvision (graceful no-op if absent).
+    """
+
+    def __init__(self, dataset, augment=True):
+        self.dataset = dataset
+        self.augment = augment and _HAS_TF
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        item = self.dataset[index]
+        if not self.augment:
+            return item
+
+        source1 = item["source1"]  # (1, H, W) float in [0, 1]
+        source2 = item["source2"]
+
+        # 1. Random horizontal flip (p=0.5) — same for both modalities
+        if torch.rand(1).item() < 0.5:
+            source1 = TF.hflip(source1)
+            source2 = TF.hflip(source2)
+
+        # 2. Random rotation ±10° — same angle for both modalities
+        angle = (torch.rand(1).item() * 2.0 - 1.0) * 10.0  # uniform in [-10, 10]
+        source1 = TF.rotate(source1, angle, interpolation=_BILINEAR)
+        source2 = TF.rotate(source2, angle, interpolation=_BILINEAR)
+
+        # 3. Brightness jitter on source1 ONLY (simulates modality variation)
+        factor = 0.9 + torch.rand(1).item() * 0.2  # uniform in [0.9, 1.1]
+        source1 = (source1 * factor).clamp(0.0, 1.0)
+
+        item = dict(item)  # shallow copy so we don't mutate cached dict
+        item["source1"] = source1
+        item["source2"] = source2
+        item["ct"] = source1
+        item["mri"] = source2
+        return item
+
+
+def build_aanlib_train_val_datasets(dataset_root, pair, image_size=256, max_items=None, val_split=0.15, seed=42, augment_train=True):
     train_root = aanlib_split_root(dataset_root, pair, "train")
     val_root = aanlib_split_root(dataset_root, pair, "val")
     train_dataset = PairedMedicalImageDataset(
@@ -296,14 +355,21 @@ def build_aanlib_train_val_datasets(dataset_root, pair, image_size=256, max_item
             strict=True,
             pair=pair,
         )
+        if augment_train:
+            train_dataset = AugmentedPairedDataset(train_dataset, augment=True)
         return train_dataset, val_dataset
 
     if len(train_dataset) <= 1 or val_split <= 0:
+        if augment_train:
+            train_dataset = AugmentedPairedDataset(train_dataset, augment=True)
         return train_dataset, None
     val_count = max(1, int(len(train_dataset) * val_split))
     train_count = len(train_dataset) - val_count
-    return random_split(
+    splits = random_split(
         train_dataset,
         [train_count, val_count],
         generator=torch.Generator().manual_seed(seed),
     )
+    if augment_train:
+        return AugmentedPairedDataset(splits[0], augment=True), splits[1]
+    return splits

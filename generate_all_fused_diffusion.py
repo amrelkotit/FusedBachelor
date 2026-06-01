@@ -5,18 +5,21 @@ import sys
 from pathlib import Path
 
 import cv2
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from src.data.paired_dataset import AANLIB_ROOT, PairedMedicalImageDataset, aanlib_split_root, diffusion_after_msfd_dir, diffusion_checkpoint_dir, diffusion_graph_dir, diffusion_image_dir, diffusion_metrics_dir, normalize_pair, pair_labels
-from src.diffusion.model import ConditionalUNet
+from src.diffusion.model import ConditionalUNet, LegacyConditionalUNet
 from src.diffusion.sampler import sample_refined
 from src.diffusion.scheduler import DiffusionScheduler
 from src.diffusion.utils import (
     fusion_reference,
+    load_gan_fused,
     postprocess_grayscale,
     presentation_enhance_grayscale,
+    read_gray_uint01,
     resize_rgb_for_presentation,
     save_comparison_panel,
     save_tensor_image,
@@ -52,18 +55,42 @@ def extract_model_state_dict(checkpoint, checkpoint_path=None):
     return checkpoint
 
 
+def _is_legacy_checkpoint(state_dict):
+    return "source_lift.weight" in state_dict
+
+
 def load_model(checkpoint_path, device):
     checkpoint_path = resolve_path(checkpoint_path)
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Diffusion checkpoint not found: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     config = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
-    model = ConditionalUNet(in_channels=4, base_channels=32, time_dim=128).to(device)
-    model.load_state_dict(normalize_state_dict_keys(extract_model_state_dict(checkpoint, checkpoint_path)), strict=True)
+    state_dict = normalize_state_dict_keys(extract_model_state_dict(checkpoint, checkpoint_path))
+    if _is_legacy_checkpoint(state_dict):
+        # Infer in_channels from actual weights — config may be stale/mismatched
+        if "in_conv.weight" in state_dict:
+            in_ch = int(state_dict["in_conv.weight"].shape[1])
+        else:
+            in_ch = int(config.get("in_channels", 3))
+        base_ch = int(config.get("base_channels", 64))
+        t_dim   = int(config.get("time_dim",      256))
+        model = LegacyConditionalUNet(in_channels=in_ch, base_channels=base_ch, time_dim=t_dim).to(device)
+    else:
+        if "in_conv.weight" in state_dict:
+            in_ch = int(state_dict["in_conv.weight"].shape[1])
+        else:
+            in_ch = int(config.get("in_channels", 4))
+        base_ch = int(config.get("base_channels", 32))
+        t_dim   = int(config.get("time_dim",      128))
+        model = ConditionalUNet(in_channels=in_ch, base_channels=base_ch, time_dim=t_dim).to(device)
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
     timesteps = int(config.get("timesteps", 1000))
     is_ema = bool(isinstance(checkpoint, dict) and checkpoint.get("is_ema", "ema" in checkpoint_path.stem))
-    return model, DiffusionScheduler(timesteps=timesteps, device=device), checkpoint_path, is_ema
+    # Default to "x0" — the current trainer always trains in x0-prediction mode.
+    # Old checkpoints without this field were also trained with x0.
+    prediction_type = str(config.get("prediction_type", "x0"))
+    return model, DiffusionScheduler(timesteps=timesteps, device=device), checkpoint_path, is_ema, prediction_type
 
 
 def select_default_checkpoint(pair, output_root):
@@ -101,8 +128,40 @@ def deprecate_ct_colored_folder(image_root):
     return destination
 
 
-def save_processed_outputs(fused_tensor, source1_path, dirs, stem, args):
+def is_noise_output(image):
+    """Return True when the image appears to be pure noise with no spatial structure.
+
+    Divides the image into a 4×4 grid of tiles and measures the coefficient of
+    variation (CV) of per-tile standard deviations.  Pure noise → all tiles have
+    similar high variance (low CV).  Structured images → background tiles have
+    low variance, brain-region tiles have high variance (high CV).
+    """
+    img = np.asarray(image, dtype="float32")
+    h, w = img.shape[:2]
+    th, tw = h // 4, w // 4
+    tile_stds = []
+    for i in range(4):
+        for j in range(4):
+            tile = img[i * th:(i + 1) * th, j * tw:(j + 1) * tw]
+            tile_stds.append(float(np.std(tile)))
+    tile_stds = np.array(tile_stds)
+    mean_std = float(np.mean(tile_stds))
+    cv = float(np.std(tile_stds)) / (mean_std + 1e-8)
+    return mean_std > 0.22 and cv < 0.25
+
+
+def save_processed_outputs(fused_tensor, source1_path, source2_path, dirs, stem, args):
     raw = tensor_to_numpy01(fused_tensor)
+    using_gan_base = False
+    if is_noise_output(raw):
+        if getattr(args, "gan_fallback", True):
+            gan_path = load_gan_fused(args.gan_root, args.pair, args.split, stem)
+            if gan_path is not None:
+                print(f"  [GAN fallback] {stem}: diffusion output is noise — using GAN structural base ({gan_path.name})")
+                raw = read_gray_uint01(gan_path)
+                using_gan_base = True
+        else:
+            print(f"  [WARNING] {stem}: diffusion output detected as noise (no GAN fallback — using diffusion output as-is)")
     processed = postprocess_grayscale(
         raw,
         normalize_output=args.normalize_output,
@@ -131,6 +190,7 @@ def save_processed_outputs(fused_tensor, source1_path, dirs, stem, args):
             args.split,
             stem,
             gan_root=args.gan_root,
+            mri_path=source2_path,
             color_mode=args.color_mode,
             alpha=args.color_alpha,
             color_strength=args.color_strength,
@@ -153,6 +213,7 @@ def save_processed_outputs(fused_tensor, source1_path, dirs, stem, args):
                 args.split,
                 stem,
                 gan_root=args.gan_root,
+                mri_path=source2_path,
                 color_mode=args.color_mode,
                 alpha=args.color_alpha,
                 color_strength=args.color_strength,
@@ -173,11 +234,12 @@ def save_processed_outputs(fused_tensor, source1_path, dirs, stem, args):
         color_mode,
         color_source_used,
         color_reference_path,
+        using_gan_base,
     )
 
 
 @torch.no_grad()
-def generate_split(model, scheduler, dataset, output_root, msfd_root, labels, checkpoint_path, args, device):
+def generate_split(model, scheduler, dataset, output_root, msfd_root, labels, checkpoint_path, args, device, prediction_type="x0"):
     fused_dir = output_root / "fused_original"
     grayscale_dir = output_root / "fused_grayscale"
     grayscale_presentation_dir = output_root / "fused_grayscale_presentation"
@@ -215,7 +277,7 @@ def generate_split(model, scheduler, dataset, output_root, msfd_root, labels, ch
     for batch in tqdm(loader, desc=f"Generate diffusion {args.pair} {args.split}", dynamic_ncols=True, file=sys.stdout):
         source1 = batch["source1"].to(device)
         source2 = batch["source2"].to(device)
-        fused, initial = sample_refined(model, scheduler, source1.float(), source2.float(), sampling_steps=args.sampling_steps)
+        fused, initial = sample_refined(model, scheduler, source1.float(), source2.float(), sampling_steps=args.sampling_steps, max_start_t=args.max_start_t, prediction_type=prediction_type)
         msfd = fusion_reference(source1.float(), source2.float(), use_msfd=True).to(device)
         for batch_index in range(fused.shape[0]):
             if args.max_items is not None and written >= args.max_items:
@@ -238,9 +300,11 @@ def generate_split(model, scheduler, dataset, output_root, msfd_root, labels, ch
                 color_mode,
                 color_source_used,
                 color_reference_path,
+                using_gan_base,
             ) = save_processed_outputs(
                 fused[batch_index].clamp(0.0, 1.0),
                 batch["source1_path"][batch_index],
+                batch["source2_path"][batch_index],
                 dirs,
                 stem,
                 args,
@@ -279,6 +343,7 @@ def generate_split(model, scheduler, dataset, output_root, msfd_root, labels, ch
                     "contrast_boost": args.contrast_boost,
                     "background_threshold": args.background_threshold,
                     "color_reference_path": color_reference_path,
+                    "using_gan_base": using_gan_base,
                 }
             )
             written += 1
@@ -297,13 +362,16 @@ def parse_args():
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--sampling-steps", type=int, default=150)
+    parser.add_argument("--max-start-t", type=int, default=400)
+    parser.add_argument("--prediction-type", dest="prediction_type", choices=["auto", "x0", "epsilon"], default="auto",
+                        help="Override prediction type from checkpoint. Use 'x0' when checkpoint config is missing or wrong.")
     parser.add_argument("--max-items", type=int, default=None)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--normalize-output", dest="normalize_output", action="store_true", default=True)
     parser.add_argument("--no-normalize-output", dest="normalize_output", action="store_false")
     parser.add_argument("--postprocess", dest="postprocess", action="store_true", default=True)
     parser.add_argument("--no-postprocess", dest="postprocess", action="store_false")
-    parser.add_argument("--enhance-edges", dest="enhance_edges", action="store_true", default=True)
+    parser.add_argument("--enhance-edges", dest="enhance_edges", action="store_true", default=False)
     parser.add_argument("--no-enhance-edges", dest="enhance_edges", action="store_false")
     parser.add_argument("--save-original", dest="save_original", action="store_true", default=True)
     parser.add_argument("--no-save-original", dest="save_original", action="store_false")
@@ -315,12 +383,15 @@ def parse_args():
     parser.add_argument("--save-colored", action="store_true")
     parser.add_argument("--no-default-colored", dest="default_colored", action="store_false", default=True)
     parser.add_argument("--gan-root", default="outputs/models/gan")
+    parser.add_argument("--gan-fallback", dest="gan_fallback", action="store_true", default=False,
+                        help="Enable GAN fallback when diffusion output is detected as noise.")
+    parser.add_argument("--no-gan-fallback", dest="gan_fallback", action="store_false")
     parser.add_argument("--color-mode", choices=["smart", "source", "gan-style", "colormap"], default="smart")
     parser.add_argument("--color-alpha", type=float, default=0.65)
     parser.add_argument("--color-strength", type=float, default=1.0)
     parser.add_argument("--saturation-boost", type=float, default=1.35)
     parser.add_argument("--contrast-boost", type=float, default=1.15)
-    parser.add_argument("--background-threshold", type=float, default=0.03)
+    parser.add_argument("--background-threshold", type=float, default=0.10)
     parser.add_argument("--colormap", choices=["hot", "jet", "inferno", "magma", "viridis"], default="hot")
     return parser.parse_args()
 
@@ -328,12 +399,15 @@ def parse_args():
 def print_color_validation(rows, pair):
     if pair == "ct_mri":
         return
-    used = {row.get("color_source_used") for row in rows if row.get("fused_colored_path")}
-    if "gan_style" in used:
+    used_mode = {row.get("color_mode") for row in rows if row.get("fused_colored_path")}
+    used_source = {row.get("color_source_used") for row in rows if row.get("fused_colored_path")}
+    if "ycrcb" in used_mode:
+        print("Colored output created using AdaFuse-style YCrCb color transfer from source")
+    if "gan_style" in used_source:
         print("Colored output created using GAN-style HSV color transfer")
-    if "source_rgb" in used:
+    if "source_rgb" in used_source and "ycrcb" not in used_mode:
         print("Colored output created using source RGB HSV color transfer")
-    if "colormap_fallback" in used:
+    if "colormap_fallback" in used_source:
         print("Colored output created using colormap fallback")
 
 
@@ -366,6 +440,7 @@ def update_global_manifest(output_root, rows):
         "contrast_boost",
         "background_threshold",
         "color_reference_path",
+        "using_gan_base",
     ]
     existing = []
     if path.exists():
@@ -388,13 +463,17 @@ def main():
     checkpoint = prefer_ema_checkpoint(args.checkpoint or select_default_checkpoint(args.pair, output_root), enabled=args.prefer_ema)
     device = "cuda" if args.device == "auto" and torch.cuda.is_available() else ("cpu" if args.device == "auto" else args.device)
     try:
-        model, scheduler, checkpoint_path, is_ema = load_model(checkpoint, device)
+        model, scheduler, checkpoint_path, is_ema, prediction_type = load_model(checkpoint, device)
     except Exception:
         fallback = resolve_path(args.checkpoint) if args.checkpoint else diffusion_checkpoint_dir(args.pair, output_root=output_root) / "best_diffusion.pt"
         if resolve_path(checkpoint) == fallback:
             raise
         print(f"[Checkpoint] Could not load preferred EMA checkpoint, falling back to: {fallback}")
-        model, scheduler, checkpoint_path, is_ema = load_model(fallback, device)
+        model, scheduler, checkpoint_path, is_ema, prediction_type = load_model(fallback, device)
+    if getattr(args, "prediction_type", "auto") != "auto":
+        if prediction_type != args.prediction_type:
+            print(f"[Prediction type] Overriding checkpoint prediction_type '{prediction_type}' → '{args.prediction_type}'")
+        prediction_type = args.prediction_type
     split_root = aanlib_split_root(resolve_path(args.dataset_root), args.pair, args.split)
     image_root = diffusion_image_dir("aanlib", args.pair, args.split, output_root=output_root)
     msfd_root = diffusion_after_msfd_dir("aanlib", args.pair, output_root=output_root)
@@ -403,6 +482,7 @@ def main():
     print(f"[Pair] {args.pair}")
     print(f"Checkpoint path: {checkpoint_path}")
     print(f"Checkpoint type: {'EMA' if is_ema else 'non-EMA'}")
+    print(f"Prediction type: {prediction_type}")
     print(f"Fused image folder: {image_root / 'fused_original'}")
     print(f"Fused grayscale folder: {image_root / 'fused_grayscale'}")
     if should_save_colored(args):
@@ -411,7 +491,7 @@ def main():
     print(f"Graph folder: {diffusion_graph_dir(output_root)}")
     print(f"Metrics folder: {diffusion_metrics_dir(output_root)}")
     dataset = PairedMedicalImageDataset(split_root, image_size=args.image_size, dataset_name=f"aanlib {args.split}", strict=True, pair=args.pair)
-    rows = generate_split(model, scheduler, dataset, image_root, msfd_root, pair_labels(args.pair), checkpoint_path, args, device)
+    rows = generate_split(model, scheduler, dataset, image_root, msfd_root, pair_labels(args.pair), checkpoint_path, args, device, prediction_type=prediction_type)
     manifest_path = image_root / "generation_manifest.csv"
     with manifest_path.open("w", newline="", encoding="utf-8") as csv_file:
         fieldnames = [
@@ -442,6 +522,7 @@ def main():
             "initial_fused_path",
             "comparison_panel",
             "msfd_reference_path",
+            "using_gan_base",
         ]
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()

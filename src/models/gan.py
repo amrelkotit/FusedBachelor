@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.models.sff import SFF
+
 
 def edge_guidance(x):
     """Fixed edge map, no trainable params, so old checkpoints still load."""
@@ -74,17 +76,42 @@ class UpBlock(nn.Module):
 
 
 class FusionGenerator(nn.Module):
-    """U-Net style generator: input [CT, MRI], output one fused grayscale image."""
+    """U-Net generator with dual-encoder + SFF.
+
+    CT and MRI are encoded through independent parallel encoder paths.
+    At every scale — skip1 (full-res, 32ch), skip2 (½-res, 64ch),
+    skip3 (¼-res, 128ch), and the bottleneck input (⅛-res, 128ch) — a
+    dedicated SFF block cross-attends the two modality feature maps in both
+    the spatial domain and the Fourier domain before handing the fused
+    representation to the decoder.
+
+    ⚠️  Breaking change vs. the previous single-encoder architecture:
+    existing checkpoints trained with the old cat([ct, mri]) design are
+    NOT compatible with this new layout.
+    """
 
     def __init__(self, base_channels=32):
         super().__init__()
-        self.down1 = DownBlock(2, base_channels)
-        self.down2 = DownBlock(base_channels, base_channels * 2)
-        self.down3 = DownBlock(base_channels * 2, base_channels * 4)
+        # --- Dual encoder paths (1-channel input each) ---
+        self.ct_down1  = DownBlock(1, base_channels)
+        self.ct_down2  = DownBlock(base_channels,     base_channels * 2)
+        self.ct_down3  = DownBlock(base_channels * 2, base_channels * 4)
+
+        self.mri_down1 = DownBlock(1, base_channels)
+        self.mri_down2 = DownBlock(base_channels,     base_channels * 2)
+        self.mri_down3 = DownBlock(base_channels * 2, base_channels * 4)
+
+        # --- SFF at every skip level + bottleneck input ---
+        self.sff1    = SFF(base_channels)          # 32-ch  full-res skips
+        self.sff2    = SFF(base_channels * 2)      # 64-ch  ½-res   skips
+        self.sff3    = SFF(base_channels * 4)      # 128-ch ¼-res   skips
+        self.sff_bot = SFF(base_channels * 4)      # 128-ch ⅛-res   bottleneck input
+
+        # --- Bottleneck + decoder (channel counts unchanged) ---
         self.bottleneck = MultiScaleConvBlock(base_channels * 4, base_channels * 8)
         self.up3 = UpBlock(base_channels * 8, base_channels * 4, base_channels * 4)
         self.up2 = UpBlock(base_channels * 4, base_channels * 2, base_channels * 2)
-        self.up1 = UpBlock(base_channels * 2, base_channels, base_channels)
+        self.up1 = UpBlock(base_channels * 2, base_channels,     base_channels)
         self.out = nn.Sequential(
             nn.Conv2d(base_channels, 16, kernel_size=3, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
@@ -92,18 +119,46 @@ class FusionGenerator(nn.Module):
             nn.Sigmoid(),
         )
 
+    def _encode(self, ct, mri, attention):
+        """Run dual encoder and fuse every scale with SFF.
+
+        Returns (skip1, skip2, skip3, x) where all tensors are already
+        cross-modality fused and ready for the decoder.
+        """
+        # Scale 1 — full resolution
+        ct_s1,  ct_x  = self.ct_down1(ct)
+        mri_s1, mri_x = self.mri_down1(mri)
+        ct_s1  = apply_source_attention(ct_s1,  attention)
+        mri_s1 = apply_source_attention(mri_s1, attention)
+        ct_x   = apply_source_attention(ct_x,   attention)
+        mri_x  = apply_source_attention(mri_x,  attention)
+
+        # Scale 2 — ½ resolution
+        ct_s2,  ct_x  = self.ct_down2(ct_x)
+        mri_s2, mri_x = self.mri_down2(mri_x)
+        ct_s2  = apply_source_attention(ct_s2,  attention)
+        mri_s2 = apply_source_attention(mri_s2, attention)
+        ct_x   = apply_source_attention(ct_x,   attention)
+        mri_x  = apply_source_attention(mri_x,  attention)
+
+        # Scale 3 — ¼ resolution
+        ct_s3,  ct_x  = self.ct_down3(ct_x)
+        mri_s3, mri_x = self.mri_down3(mri_x)
+        ct_s3  = apply_source_attention(ct_s3,  attention)
+        mri_s3 = apply_source_attention(mri_s3, attention)
+        ct_x   = apply_source_attention(ct_x,   attention)
+        mri_x  = apply_source_attention(mri_x,  attention)
+
+        # SFF fusion at every scale
+        skip1 = self.sff1(ct_s1, mri_s1)
+        skip2 = self.sff2(ct_s2, mri_s2)
+        skip3 = self.sff3(ct_s3, mri_s3)
+        x     = self.sff_bot(ct_x, mri_x)        # feeds into bottleneck
+        return skip1, skip2, skip3, x
+
     def forward(self, ct, mri):
-        x = torch.cat([ct, mri], dim=1)
         attention = source_edge_attention(ct, mri)
-        skip1, x = self.down1(x)
-        skip1 = apply_source_attention(skip1, attention)
-        x = apply_source_attention(x, attention)
-        skip2, x = self.down2(x)
-        skip2 = apply_source_attention(skip2, attention)
-        x = apply_source_attention(x, attention)
-        skip3, x = self.down3(x)
-        skip3 = apply_source_attention(skip3, attention)
-        x = apply_source_attention(x, attention)
+        skip1, skip2, skip3, x = self._encode(ct, mri, attention)
         x = self.bottleneck(x)
         x = apply_source_attention(x, attention)
         x = self.up3(x, skip3)
@@ -115,18 +170,9 @@ class FusionGenerator(nn.Module):
         return self.out(x)
 
     def forward_with_debug(self, ct, mri):
-        """Return final output plus values before/after final activation."""
-        x = torch.cat([ct, mri], dim=1)
+        """Return (final_output, pre_activation, post_activation)."""
         attention = source_edge_attention(ct, mri)
-        skip1, x = self.down1(x)
-        skip1 = apply_source_attention(skip1, attention)
-        x = apply_source_attention(x, attention)
-        skip2, x = self.down2(x)
-        skip2 = apply_source_attention(skip2, attention)
-        x = apply_source_attention(x, attention)
-        skip3, x = self.down3(x)
-        skip3 = apply_source_attention(skip3, attention)
-        x = apply_source_attention(x, attention)
+        skip1, skip2, skip3, x = self._encode(ct, mri, attention)
         x = self.bottleneck(x)
         x = apply_source_attention(x, attention)
         x = self.up3(x, skip3)
@@ -137,7 +183,7 @@ class FusionGenerator(nn.Module):
         x = apply_source_attention(x, attention)
         x = self.out[0](x)
         x = self.out[1](x)
-        pre_activation = self.out[2](x)
+        pre_activation  = self.out[2](x)
         post_activation = self.out[3](pre_activation)
         return post_activation, pre_activation, post_activation
 

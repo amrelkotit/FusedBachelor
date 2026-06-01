@@ -64,14 +64,18 @@ def metrics_for_pair(dataset, fused_dir, image_size):
             "source1_path": sample["source1_path"],
             "source2_path": sample["source2_path"],
             "fused_path": str(fused_paths[index]),
-            "SSIM": 0.5 * (metrics["SSIM_MRI"] + metrics["SSIM_CT"]),
-            "PSNR": 0.5 * (metrics["PSNR_MRI"] + metrics["PSNR_CT"]),
-            "MI": 0.5 * (metrics["MI_MRI"] + metrics["MI_CT"]),
-            "EN": metrics["EN"],
-            "CC": metrics["CC"],
-            "FMI": metrics["FMI"],
-            "SF": metrics["SF"],
-            "AG": metrics["AG"],
+            # Use the aggregated keys from evaluate_fusion:
+            #   PSNR  = avg(PSNR_MRI, PSNR_CT)  with data_range=1.0 (images in [0,1])
+            #   SSIM  = avg(SSIM_MRI, SSIM_CT)
+            #   MI    = MI_MRI + MI_CT  (sum, 256-bin histograms)
+            "SSIM": metrics["SSIM"],
+            "PSNR": metrics["PSNR"],
+            "MI":   metrics["MI"],
+            "EN":   metrics["EN"],
+            "CC":   metrics["CC"],
+            "FMI":  metrics["FMI"],
+            "SF":   metrics["SF"],
+            "AG":   metrics["AG"],
         }
         rows.append(row)
     return rows
@@ -100,7 +104,7 @@ def update_summary_files(metrics_dir):
         rows.append({"pair": pair, **{field: summary[field] for field in METRIC_FIELDS}})
     if not rows:
         return
-    for filename in ("all_pairs_summary.csv", "thesis_comparison_table.csv"):
+    for filename in ("all_pairs_gan_summary.csv", "thesis_comparison_table.csv"):
         with (metrics_dir / filename).open("w", newline="", encoding="utf-8") as csv_file:
             writer = csv.DictWriter(csv_file, fieldnames=["pair", *METRIC_FIELDS])
             writer.writeheader()

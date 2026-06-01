@@ -1,11 +1,51 @@
+import math
+
 import torch
 
 
+def cosine_betas(timesteps, s=0.008):
+    """Cosine noise schedule (Nichol & Dhariwal, improved DDPM, 2021).
+
+    Produces a smoother variance curve than linear, especially at low
+    timesteps, leading to better perceptual image quality.
+    """
+    steps = timesteps + 1
+    t = torch.linspace(0, timesteps, steps) / timesteps
+    alphas_bar = torch.cos((t + s) / (1 + s) * math.pi / 2) ** 2
+    alphas_bar = alphas_bar / alphas_bar[0]
+    betas = 1 - (alphas_bar[1:] / alphas_bar[:-1])
+    return betas.clamp(0.0001, 0.9999)
+
+
 class DiffusionScheduler:
-    def __init__(self, timesteps=1000, beta_start=1e-4, beta_end=0.02, device="cpu"):
+    """Forward / reverse diffusion schedule.
+
+    Parameters
+    ----------
+    schedule : {"linear", "cosine"}
+        "linear"  – classic linear beta schedule (default, keeps
+                    checkpoint compatibility).
+        "cosine"  – improved cosine schedule; better image quality,
+                    less over-noising at low timesteps.
+    """
+
+    def __init__(
+        self,
+        timesteps=1000,
+        beta_start=1e-4,
+        beta_end=0.02,
+        schedule="linear",
+        device="cpu",
+    ):
         self.timesteps = int(timesteps)
         self.device = device
-        self.betas = torch.linspace(beta_start, beta_end, self.timesteps, device=device)
+        self.schedule = str(schedule).strip().lower()
+
+        if self.schedule == "cosine":
+            self.betas = cosine_betas(self.timesteps).to(device)
+        else:  # "linear" — original behaviour
+            self.betas = torch.linspace(beta_start, beta_end, self.timesteps, device=device)
+
         self.alphas = 1.0 - self.betas
         self.alpha_bars = torch.cumprod(self.alphas, dim=0)
 
@@ -32,4 +72,3 @@ class DiffusionScheduler:
         noise = torch.randn_like(xt)
         nonzero = (t > 0).float().view(-1, 1, 1, 1)
         return mean + nonzero * beta.sqrt() * noise
-

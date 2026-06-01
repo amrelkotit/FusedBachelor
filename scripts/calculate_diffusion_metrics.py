@@ -47,16 +47,17 @@ def numeric_mean(value):
 
 def metric_row(fused, source1, source2):
     metrics = evaluate_fusion(fused, source2, source1)
+    # Use aggregated keys: PSNR with data_range=1.0, MI as sum of MI_MRI+MI_CT
     return {
-        "SSIM": 0.5 * (metrics["SSIM_MRI"] + metrics["SSIM_CT"]),
-        "PSNR": 0.5 * (metrics["PSNR_MRI"] + metrics["PSNR_CT"]),
-        "MI": 0.5 * (metrics["MI_MRI"] + metrics["MI_CT"]),
-        "EN": metrics["EN"],
-        "SF": metrics["SF"],
-        "AG": metrics["AG"],
+        "SSIM": metrics.get("SSIM", 0.5 * (metrics["SSIM_MRI"] + metrics["SSIM_CT"])),
+        "PSNR": metrics.get("PSNR", 0.5 * (metrics["PSNR_MRI"] + metrics["PSNR_CT"])),
+        "MI":   metrics.get("MI", 0.0),   # sum MI_MRI + MI_CT (256 bins)
+        "EN":   metrics["EN"],
+        "SF":   metrics["SF"],
+        "AG":   metrics["AG"],
         "Edge_Intensity": metrics.get("EPI", 0.0),
-        "CC": metrics.get("CC", 0.0),
-        "FMI": metrics.get("FMI", 0.0),
+        "CC":   metrics.get("CC", 0.0),
+        "FMI":  metrics.get("FMI", 0.0),
     }
 
 
@@ -320,6 +321,23 @@ def main():
     metrics_dir.mkdir(parents=True, exist_ok=True)
 
     detailed, gan_found, baseline_found = calculate_metrics(dataset_root, output_root, gan_root, pairs, args.split, args.image_size, max_items=args.max_items)
+
+    # When called with a specific pair, merge with existing detailed CSV so the
+    # combined summaries always contain all previously-computed pairs.  Without
+    # this, each per-pair call would overwrite the combined CSVs and only the
+    # last pair would survive in the final summary files.
+    if args.pair != "all":
+        detailed_path = metrics_dir / "diffusion_metrics_detailed.csv"
+        if detailed_path.exists():
+            with detailed_path.open(newline="", encoding="utf-8") as f:
+                existing = list(csv.DictReader(f))
+            # Drop stale rows for the pairs being updated, then re-add fresh rows.
+            existing = [row for row in existing if row.get("pair") not in pairs]
+            detailed = existing + detailed
+        # Recalculate gan_found / baseline_found across ALL pairs in the merged data.
+        gan_found = any(row.get("variant") == "gan" for row in detailed)
+        baseline_found = any(row.get("variant") == "average_baseline" for row in detailed)
+
     detailed_fields = ["pair", "split", "image", "variant", "source_modality_path", "mri_path", "fused_path", *ALL_METRIC_COLUMNS]
     write_csv(metrics_dir / "diffusion_metrics_detailed.csv", detailed, detailed_fields)
 
@@ -328,7 +346,10 @@ def main():
     write_csv(metrics_dir / "diffusion_vs_baseline_summary.csv", comparison_summary(summary, "average_baseline"), ["pair", "metric", "diffusion_variant", "comparison_variant", "diffusion_mean", "comparison_mean", "delta_diffusion_minus_comparison"])
     write_csv(metrics_dir / "diffusion_vs_gan_summary.csv", comparison_summary(summary, "gan"), ["pair", "metric", "diffusion_variant", "comparison_variant", "diffusion_mean", "comparison_mean", "delta_diffusion_minus_comparison"])
     write_legacy_pair_files(metrics_dir, summary)
-    write_training_summary(metrics_dir, output_root, pairs, args.split, summary)
+    # For per-pair calls, pass all pairs represented in the merged data so the
+    # training summary covers every pair that has been processed so far.
+    summary_pairs = list(dict.fromkeys(row["pair"] for row in summary if row.get("pair"))) if args.pair != "all" else pairs
+    write_training_summary(metrics_dir, output_root, summary_pairs, args.split, summary)
     write_thesis_summary(metrics_dir, summary, gan_found, baseline_found)
 
 

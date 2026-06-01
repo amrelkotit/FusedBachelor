@@ -62,6 +62,16 @@ def percentile_normalize(image, low=1.0, high=99.0):
     return np.clip((image - lo) / (hi - lo), 0.0, 1.0)
 
 
+def brain_mask(gray_f32):
+    """Otsu brain mask with morphological cleanup and soft Gaussian edges."""
+    u8 = (np.clip(np.asarray(gray_f32, dtype="float32"), 0.0, 1.0) * 255.0).astype("uint8")
+    _, m = cv2.threshold(u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k)
+    return cv2.GaussianBlur(m.astype("float32") / 255.0, (0, 0), 2.0)
+
+
 def postprocess_grayscale(image, normalize_output=False, postprocess=False, enhance_edges=False):
     image = np.asarray(image, dtype="float32")
     if normalize_output:
@@ -69,7 +79,7 @@ def postprocess_grayscale(image, normalize_output=False, postprocess=False, enha
     image = np.clip(image, 0.0, 1.0)
     if postprocess:
         u8 = (image * 255.0).round().astype("uint8")
-        u8 = cv2.bilateralFilter(u8, d=3, sigmaColor=8, sigmaSpace=3)
+        u8 = cv2.bilateralFilter(u8, d=7, sigmaColor=20, sigmaSpace=10)
         image = u8.astype("float32") / 255.0
     if enhance_edges:
         blurred = cv2.GaussianBlur(image, (0, 0), sigmaX=0.8)
@@ -78,15 +88,48 @@ def postprocess_grayscale(image, normalize_output=False, postprocess=False, enha
 
 
 def presentation_enhance_grayscale(image, output_size=512, local_contrast=True, unsharp=True):
+    """Presentation-quality enhancement for grayscale fused images.
+
+    Pipeline (in order):
+      1. Percentile normalise (1st / 99th) → full [0, 255] range
+      2. NLMeans denoising   – removes diffusion-model noise before sharpening
+      3. CLAHE               – strong local contrast  (clipLimit=2.2)
+      4. Unsharp mask        – high-frequency sharpening  (σ=1.0, α=0.40)
+      5. Percentile normalise again to restore full dynamic range
+      6. Upscale to output_size × output_size with Lanczos4
+    """
     image = np.clip(np.asarray(image, dtype="float32"), 0.0, 1.0)
+
+    # Step 1: percentile normalise → full [0, 255]
+    lo, hi = np.percentile(image, [1.0, 99.0])
+    if hi > lo + 1e-8:
+        image = np.clip((image - lo) / (hi - lo), 0.0, 1.0)
     u8 = (image * 255.0).round().astype("uint8")
+
+    # Step 2: NLMeans denoising (removes diffusion-model noise before sharpening)
+    u8 = cv2.fastNlMeansDenoising(u8, h=10, templateWindowSize=7, searchWindowSize=21)
+
+    # Step 3: CLAHE – stronger local contrast recovery
     if local_contrast:
-        clahe = cv2.createCLAHE(clipLimit=1.35, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
         u8 = clahe.apply(u8)
+
+    # Step 3.5: brain mask — suppress background noise outside the brain region
+    mask = brain_mask(u8.astype("float32") / 255.0)
+    u8 = (u8.astype("float32") * mask).round().astype("uint8")
+
+    # Step 4: Unsharp mask
     enhanced = u8.astype("float32") / 255.0
     if unsharp:
-        blurred = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=0.65)
-        enhanced = np.clip(enhanced + 0.18 * (enhanced - blurred), 0.0, 1.0)
+        blurred = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=1.0)
+        enhanced = np.clip(enhanced + 0.40 * (enhanced - blurred), 0.0, 1.0)
+
+    # Step 5: percentile normalise again to restore full dynamic range
+    lo2, hi2 = np.percentile(enhanced, [1.0, 99.0])
+    if hi2 > lo2 + 1e-8:
+        enhanced = np.clip((enhanced - lo2) / (hi2 - lo2), 0.0, 1.0)
+
+    # Step 6: upscale
     if output_size and int(output_size) > 0 and enhanced.shape[:2] != (int(output_size), int(output_size)):
         enhanced = cv2.resize(enhanced, (int(output_size), int(output_size)), interpolation=cv2.INTER_LANCZOS4)
     return enhanced
@@ -106,6 +149,38 @@ COLORMAPS = {
     "magma": cv2.COLORMAP_MAGMA,
     "viridis": cv2.COLORMAP_VIRIDIS,
 }
+
+
+def ycrcb_colorize_from_source(fused_gray_f32, source_rgb, mri_gray_f32=None, alpha=0.70):
+    """Source Cr/Cb color channels + MRI (or fused) luminance + brain mask blend.
+
+    When mri_gray_f32 is provided (preferred), MRI is used as the Y channel so that
+    crisp anatomical structure is preserved; the model output is ignored for brightness.
+    The colored result is then blended 70/30 over the enhanced MRI gray background
+    and masked to suppress background noise outside the brain.
+    """
+    source_u8 = (np.clip(np.asarray(source_rgb, dtype="float32"), 0.0, 1.0) * 255.0).round().astype("uint8")
+    source_bgr = cv2.cvtColor(source_u8, cv2.COLOR_RGB2BGR)
+    ycrcb = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2YCrCb)
+
+    if mri_gray_f32 is not None:
+        luma_f32 = np.clip(np.asarray(mri_gray_f32, dtype="float32"), 0.0, 1.0)
+    else:
+        luma_f32 = np.clip(np.asarray(fused_gray_f32, dtype="float32"), 0.0, 1.0)
+
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    luma_u8 = clahe.apply((luma_f32 * 255.0).round().astype("uint8"))
+    ycrcb[:, :, 0] = cv2.normalize(luma_u8, None, 0, 255, cv2.NORM_MINMAX)
+    colored_bgr = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+    colored_rgb = cv2.cvtColor(colored_bgr, cv2.COLOR_BGR2RGB).astype("float32") / 255.0
+
+    mri_gray = np.clip(luma_f32, 0.0, 1.0)
+    mri_rgb = np.repeat(mri_gray[:, :, None], 3, axis=2)
+    blended = np.clip((1.0 - alpha) * mri_rgb + alpha * colored_rgb, 0.0, 1.0)
+
+    mask = brain_mask(mri_gray)
+    blended = blended * mask[:, :, None] + mri_rgb * (1.0 - mask[:, :, None])
+    return (np.clip(blended, 0.0, 1.0) * 255.0).round().astype("uint8")
 
 
 def apply_medical_colormap(functional_gray, colormap="hot"):
@@ -196,8 +271,10 @@ def hsv_color_transfer_from_reference(
     gray_rgb = np.repeat(value[:, :, None], 3, axis=2)
     alpha = float(np.clip(alpha, 0.0, 1.0))
     colored = np.clip((1.0 - alpha) * gray_rgb + alpha * transferred, 0.0, 1.0)
-    colored[~mask] = gray_rgb[~mask]
-    return (colored * 255.0).round().astype("uint8")
+    # Soft Gaussian-blurred mask avoids abrupt boundary artifacts at brain edge
+    mask_soft = cv2.GaussianBlur(mask.astype("float32"), (0, 0), 2.0)
+    colored = colored * mask_soft[:, :, None] + gray_rgb * (1.0 - mask_soft[:, :, None])
+    return (np.clip(colored, 0.0, 1.0) * 255.0).round().astype("uint8")
 
 
 def hsv_colorize_colormap_fallback(
@@ -240,6 +317,7 @@ def smart_colorize_functional_fusion(
     split,
     stem,
     gan_root=None,
+    mri_path=None,
     color_mode="smart",
     alpha=0.65,
     color_strength=1.0,
@@ -255,11 +333,19 @@ def smart_colorize_functional_fusion(
     if requested not in {"smart", "source", "gan-style", "colormap"}:
         raise ValueError("color_mode must be one of: smart, source, gan-style, colormap")
 
+    # Load MRI for use as structural luminance base (gives crisp anatomy)
+    mri_gray = None
+    if mri_path is not None:
+        try:
+            mri_gray = read_gray_image(mri_path, image_size=grayscale.shape[::-1])
+        except Exception:
+            pass
+
     gan_ref = gan_colored_reference_path(gan_root, pair, split, stem)
-    if requested in {"smart", "gan-style"} and gan_ref is not None:
+    if requested == "gan-style" and gan_ref is not None:
         gan_rgb = read_rgb_image01(gan_ref, image_size=grayscale.shape[::-1])
         colored = hsv_color_transfer_from_reference(
-            grayscale,
+            mri_gray if mri_gray is not None else grayscale,
             gan_rgb,
             alpha=alpha,
             color_strength=color_strength,
@@ -274,22 +360,15 @@ def smart_colorize_functional_fusion(
     if requested in {"smart", "source"}:
         source_rgb = read_rgb_image01(source_path, image_size=grayscale.shape[::-1])
         if image_has_color_style(source_rgb):
-            colored = hsv_color_transfer_from_reference(
-                grayscale,
-                source_rgb,
-                alpha=alpha,
-                color_strength=color_strength,
-                saturation_boost=saturation_boost,
-                contrast_boost=contrast_boost,
-                background_threshold=background_threshold,
-            )
-            return colored, "source", "source_rgb", str(source_path)
+            colored = ycrcb_colorize_from_source(grayscale, source_rgb, mri_gray_f32=mri_gray)
+            return colored, "ycrcb", "source_rgb", str(source_path)
         if requested == "source":
             requested = "colormap"
 
     functional = read_gray_image(source_path, image_size=grayscale.shape[::-1])
+    base = mri_gray if mri_gray is not None else grayscale
     colored = hsv_colorize_colormap_fallback(
-        grayscale,
+        base,
         functional,
         alpha=alpha,
         color_strength=color_strength,
@@ -346,3 +425,11 @@ def read_gray_tensor(path, image_size=256):
     image = image.astype("float32")
     image = (image - image.min()) / (image.max() - image.min() + 1e-8)
     return torch.from_numpy(image).unsqueeze(0).unsqueeze(0)
+
+
+def load_gan_fused(gan_root, pair, split, stem):
+    """Return the path to the GAN fused_original image for this pair/split/stem, or None."""
+    if gan_root is None:
+        return None
+    path = Path(gan_root) / "images" / "aanlib" / split / pair / "fused_original" / f"{stem}_fused.png"
+    return path if path.is_file() else None

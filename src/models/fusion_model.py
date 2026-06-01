@@ -4,6 +4,7 @@ import torch.nn as nn
 
 from src.fusion.decomposition import multiscale_fuse
 from src.models.feature_extractor import MultiScaleFeatureExtractor
+from src.models.sff import SFF
 
 
 class FusionNet(nn.Module):
@@ -11,6 +12,9 @@ class FusionNet(nn.Module):
         super().__init__()
 
         self.feature_extractor = MultiScaleFeatureExtractor()
+        # MultiScaleFeatureExtractor outputs 64 channels at a single spatial scale;
+        # one SFF instance is sufficient.
+        self.sff = SFF(channels=64)
 
         self.decoder = nn.Sequential(
             nn.Conv2d(64, 32, kernel_size=3, padding=1),
@@ -23,10 +27,10 @@ class FusionNet(nn.Module):
 
     def forward(self, mri, ct):
         feat_mri = self.feature_extractor(mri)
-        feat_ct = self.feature_extractor(ct)
-
-        # Feature-level max fusion preserves the strongest modality response.
-        fused = torch.max(feat_mri, feat_ct)
+        feat_ct  = self.feature_extractor(ct)
+        # SFF replaces the old element-wise max — cross-attends spatially
+        # and in the frequency domain, then merges both paths.
+        fused = self.sff(feat_mri, feat_ct)
         return self.decoder(fused)
 
 
