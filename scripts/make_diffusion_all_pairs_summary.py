@@ -24,11 +24,13 @@ def read_summary_optional(metrics_dir):
     path = metrics_dir / "diffusion_metrics_summary.csv"
     if not path.exists():
         return {}
-    with path.open(newline="", encoding="utf-8") as f:
+    # utf-8-sig strips the BOM that write_csv writes, so the "pair" key is intact
+    with path.open(newline="", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
 
     def ssim_mean(row):
-        text = str(row.get("SSIM", "0")).split("+/-")[0].strip()
+        raw = str(row.get("SSIM", "0"))
+        text = raw.split("±")[0].split("+/-")[0].strip()
         try:
             return float(text)
         except ValueError:
@@ -50,7 +52,7 @@ def read_per_pair(metrics_dir, pair):
     path = metrics_dir / f"per_pair_metrics_{pair}.csv"
     if not path.exists():
         return None
-    with path.open(newline="", encoding="utf-8") as f:
+    with path.open(newline="", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
     for row in rows:
         if row.get("image", "").startswith("mean"):
@@ -86,7 +88,7 @@ def main():
         return
 
     out_path = METRICS_DIR / "all_pairs_diffusion_summary.csv"
-    with out_path.open("w", newline="", encoding="utf-8") as f:
+    with out_path.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS)
         writer.writeheader()
         writer.writerows(output_rows)

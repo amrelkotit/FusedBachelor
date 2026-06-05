@@ -25,6 +25,8 @@ import cv2
 import torch
 import gradio as gr
 from PIL import Image
+import tempfile
+import traceback
 
 from src.models.gan import FusionGenerator
 from src.evaluation.metrics import (
@@ -185,13 +187,19 @@ def fuse_images(source1_img, source2_img, pair_choice: str):
         status_msg       - str
     """
     if source1_img is None or source2_img is None:
-        err = "WARN: Please upload both source images before fusing."
-        return None, None, None, [], err
+        raise gr.Error("Please upload both source images before fusing.")
 
     try:
         # PIL images come in directly from gr.Image(type="pil")
         src1_pil = source1_img if isinstance(source1_img, Image.Image) else Image.fromarray(source1_img)
         src2_pil = source2_img if isinstance(source2_img, Image.Image) else Image.fromarray(source2_img)
+
+        # Low-resolution warning
+        w1, h1 = src1_pil.size
+        w2, h2 = src2_pil.size
+        status_notes = []
+        if w1 < 64 or h1 < 64 or w2 < 64 or h2 < 64:
+            status_notes.append("WARN: Image resolution is very low — results may be poor.")
 
         # Preserve original color for display and PET/SPECT colorization
         src1_display = src1_pil.convert("RGB").resize((256, 256), Image.LANCZOS)
@@ -226,6 +234,11 @@ def fuse_images(source1_img, source2_img, pair_choice: str):
         else:
             fused_display = _tensor_to_pil(fused_t)
 
+        # Save fused image to a temp file so the download button can serve it
+        tmp_fused = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        fused_display.save(tmp_fused.name)
+        tmp_fused.close()
+
         # ── Compute metrics (data_range=255.0 matches thesis convention) ──────
         label1, label2 = PAIR_LABELS[pair_choice]
 
@@ -242,8 +255,7 @@ def fuse_images(source1_img, source2_img, pair_choice: str):
         sf_val   = spatial_frequency(fused_t)
         ag_val   = average_gradient(fused_t)
 
-        metrics_table = [
-            ["Metric",                 f"Fused vs {label1}", f"Fused vs {label2}", "Description"],
+        metrics_rows = [
             ["PSNR (dB)",              _fmt(psnr_s1),         _fmt(psnr_s2),        "Peak Signal-to-Noise Ratio"],
             ["SSIM",                   _fmt(ssim_s1),         _fmt(ssim_s2),        "Structural Similarity Index"],
             ["MI (bits)",              _fmt(mi_s1),           _fmt(mi_s2),          "Mutual Information"],
@@ -253,20 +265,25 @@ def fuse_images(source1_img, source2_img, pair_choice: str):
             ["SF",                     _fmt(sf_val),          "-",                  "Spatial Frequency"],
             ["AG",                     _fmt(ag_val),          "-",                  "Average Gradient"],
         ]
+        metrics_headers = ["Metric", f"Fused vs {label1}", f"Fused vs {label2}", "Description"]
 
         status = f"OK: Fusion complete [{pair_choice}] | Device: {str(DEVICE).upper()}"
+        if status_notes:
+            status += "\n" + "\n".join(status_notes)
         return (
             src1_display,
             src2_display,
             fused_display,
-            metrics_table,
+            gr.update(headers=metrics_headers, value=metrics_rows),
             status,
+            gr.update(visible=True, value=tmp_fused.name),
         )
 
+    except gr.Error:
+        raise
     except Exception as exc:  # noqa: BLE001
-        import traceback
-        tb = traceback.format_exc()
-        return None, None, None, [], f"ERROR: {exc}\n\n{tb}"
+        print(traceback.format_exc())
+        raise gr.Error(str(exc))
 
 
 # -- Dynamic label updater ------------------------------------------------------
@@ -274,6 +291,16 @@ def fuse_images(source1_img, source2_img, pair_choice: str):
 def update_labels(pair_choice: str):
     label1, label2 = PAIR_LABELS[pair_choice]
     return gr.update(label=label1), gr.update(label=label2)
+
+
+# -- Sample image paths for gr.Examples -----------------------------------------
+
+_SAMPLE_CT     = os.path.join(ROOT, "data", "raw", "AANLIB", "CT-MRI",    "test", "CT",    "16009.png")
+_SAMPLE_MRI_CT = os.path.join(ROOT, "data", "raw", "AANLIB", "CT-MRI",    "test", "MRI",   "16009.png")
+_SAMPLE_PET    = os.path.join(ROOT, "data", "raw", "AANLIB", "PET-MRI",   "test", "PET",   "25015.png")
+_SAMPLE_MRI_PET= os.path.join(ROOT, "data", "raw", "AANLIB", "PET-MRI",   "test", "MRI",   "25015.png")
+_SAMPLE_SPECT  = os.path.join(ROOT, "data", "raw", "AANLIB", "SPECT-MRI", "test", "SPECT", "10018.png")
+_SAMPLE_MRI_SP = os.path.join(ROOT, "data", "raw", "AANLIB", "SPECT-MRI", "test", "MRI",   "10018.png")
 
 
 # -- Gradio UI ------------------------------------------------------------------
@@ -411,18 +438,10 @@ body, .gradio-container {
 }
 """
 
-with gr.Blocks(
-    css=CSS,
-    title="Medical Image Fusion Demo",
-    theme=gr.themes.Base(
-        primary_hue="blue",
-        secondary_hue="slate",
-        neutral_hue="slate",
-    ),
-) as demo:
+with gr.Blocks(title="Medical Image Fusion Demo") as demo:
 
     # ── Header ─────────────────────────────────────────────────────────────────
-    gr.HTML("""
+    gr.HTML(f"""
     <div class="app-header">
         <h1>🧠 Medical Image Fusion</h1>
         <p>
@@ -432,6 +451,7 @@ with gr.Blocks(
         <span class="badge">CT · PET · SPECT + MRI</span>
         <span class="badge">256 × 256 | Color PET/SPECT</span>
         <span class="badge">Bachelor Thesis Demo</span>
+        <span class="badge">Device: {DEVICE}</span>
     </div>
     """)
 
@@ -466,6 +486,16 @@ with gr.Blocks(
 
             fuse_btn = gr.Button("⚡  Fuse Images", elem_classes="fuse-btn", variant="primary")
 
+            gr.Examples(
+                examples=[
+                    [_SAMPLE_CT,    _SAMPLE_MRI_CT,  "CT-MRI"],
+                    [_SAMPLE_PET,   _SAMPLE_MRI_PET, "PET-MRI"],
+                    [_SAMPLE_SPECT, _SAMPLE_MRI_SP,  "SPECT-MRI"],
+                ],
+                inputs=[src1_input, src2_input, pair_dropdown],
+                label="Sample Image Pairs",
+            )
+
             status_out = gr.Textbox(
                 label="",
                 interactive=False,
@@ -473,6 +503,11 @@ with gr.Blocks(
                 show_label=False,
                 placeholder="Status will appear here after fusion …",
                 max_lines=3,
+            )
+
+            download_btn = gr.DownloadButton(
+                label="⬇  Download Fused Image",
+                visible=False,
             )
 
         # ── Right panel: outputs ────────────────────────────────────────────
@@ -520,9 +555,9 @@ with gr.Blocks(
             """)
 
             metrics_out = gr.Dataframe(
-                headers=["Metric", "Fused vs Source 1", "Fused vs Source 2", "Description"],
+                headers=["Metric", "Fused vs CT Image", "Fused vs MRI Image", "Description"],
                 datatype=["str", "str", "str", "str"],
-                col_count=(4, "fixed"),
+                column_count=(4, "fixed"),
                 interactive=False,
                 wrap=True,
                 elem_classes="metrics-table",
@@ -551,17 +586,25 @@ with gr.Blocks(
     fuse_btn.click(
         fn=fuse_images,
         inputs=[src1_input, src2_input, pair_dropdown],
-        outputs=[out_src1, out_src2, out_fused, metrics_out, status_out],
+        outputs=[out_src1, out_src2, out_fused, metrics_out, status_out, download_btn],
         api_name="fuse",
+        show_progress="full",
     )
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    demo.queue()
     demo.launch(
         server_name="0.0.0.0",
         server_port=int(os.environ.get("GRADIO_SERVER_PORT", 7860)),
         share=False,
         inbrowser=True,
         show_error=True,
+        css=CSS,
+        theme=gr.themes.Base(
+            primary_hue="blue",
+            secondary_hue="slate",
+            neutral_hue="slate",
+        ),
     )

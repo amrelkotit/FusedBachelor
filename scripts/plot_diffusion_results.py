@@ -38,7 +38,9 @@ def numeric(value):
     if value in (None, "", "None"):
         return None
     text = str(value)
-    if "+/-" in text:
+    if "±" in text:
+        text = text.split("±", 1)[0].strip()
+    elif "+/-" in text:
         text = text.split("+/-", 1)[0].strip()
     try:
         return float(text)

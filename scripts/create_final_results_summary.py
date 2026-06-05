@@ -54,7 +54,8 @@ def build_summary(metrics_dir):
 
 def write_csv(rows, path):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as csv_file:
+    # utf-8-sig writes a BOM so Excel decodes the "±" character correctly
+    with path.open("w", newline="", encoding="utf-8-sig") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=["Pair", *METRIC_COLUMNS])
         writer.writeheader()
         writer.writerows(rows)

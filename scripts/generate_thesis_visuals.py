@@ -88,10 +88,12 @@ def _read_csv(path):
 
 
 def _parse_mean_std(s):
-    """'0.337 +/- 0.038'  →  (0.337, 0.038)"""
-    parts = str(s).split("+/-")
-    if len(parts) == 2:
-        return float(parts[0].strip()), float(parts[1].strip())
+    """'0.337±0.04' or '0.337 +/- 0.038'  →  (0.337, 0.038)"""
+    text = str(s)
+    for sep in ("±", "+/-"):
+        parts = text.split(sep)
+        if len(parts) == 2:
+            return float(parts[0].strip()), float(parts[1].strip())
     try:
         return float(s), 0.0
     except ValueError:

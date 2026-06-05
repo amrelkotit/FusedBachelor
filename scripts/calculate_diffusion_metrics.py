@@ -32,12 +32,14 @@ def summarize(values):
         return ""
     tensor = torch.tensor(values, dtype=torch.float32)
     std = tensor.std(unbiased=False).item() if tensor.numel() > 1 else 0.0
-    return f"{tensor.mean().item():.6f} +/- {std:.6f}"
+    return f"{tensor.mean().item():.3f}±{std:.2f}"
 
 
 def numeric_mean(value):
     text = str(value or "").strip()
-    if "+/-" in text:
+    if "±" in text:
+        text = text.split("±", 1)[0].strip()
+    elif "+/-" in text:
         text = text.split("+/-", 1)[0].strip()
     try:
         return float(text)
@@ -63,16 +65,13 @@ def metric_row(fused, source1, source2):
 
 def gan_candidate(gan_root, pair, split, index):
     stem = f"{index:04d}_fused.png"
-    candidates = []
-    if pair == "ct_mri":
-        candidates.append(gan_root / "images" / "aanlib" / split / pair / "fused_original" / stem)
-    else:
-        candidates.extend(
-            [
-                gan_root / "images" / "aanlib" / split / pair / "fused_color" / stem,
-                gan_root / "images" / "aanlib" / split / pair / "fused_original" / stem,
-            ]
-        )
+    # Always prefer fused_original (single-channel grayscale) for metric computation.
+    # fused_color is a jet-colormap RGB image; its grayscale luminance does not
+    # correspond to the fused intensity, so SSIM/PSNR/MI on it would be wrong.
+    candidates = [
+        gan_root / "images" / "aanlib" / split / pair / "fused_original" / stem,
+        gan_root / "images" / "aanlib" / split / pair / "fused_color" / stem,
+    ]
     return next((path for path in candidates if path.exists()), None)
 
 
@@ -84,8 +83,9 @@ def candidate_outputs(output_root, gan_root, pair, split, index):
         "diffusion_fused_grayscale": image_dir / "fused_grayscale" / stem,
         "average_baseline": output_root / "baselines" / "average" / "aanlib" / pair / split / f"{index:04d}_average.png",
     }
-    if pair in {"pet_mri", "spect_mri"}:
-        candidates["diffusion_fused_colored"] = image_dir / "fused_colored" / stem
+    # fused_colored is a 3-channel RGB jet-colormap PNG — SSIM on its
+    # grayscale luminance is non-monotonic and artificially inflates scores.
+    # Metrics are computed only on single-channel pre-colormap images.
     gan_path = gan_candidate(gan_root, pair, split, index)
     if gan_path is not None:
         candidates["gan"] = gan_path
@@ -125,6 +125,10 @@ def calculate_metrics(dataset_root, output_root, gan_root, pairs, split, image_s
                 gan_found = gan_found or variant == "gan"
                 baseline_found = baseline_found or variant == "average_baseline"
                 fused = read_gray_tensor(path, image_size=image_size)
+                assert fused.shape[1] == 1, (
+                    f"SSIM must be computed on a single-channel image; "
+                    f"got shape {tuple(fused.shape)} for {variant} at {path}"
+                )
                 metrics = metric_row(fused, source1, source2)
                 detailed.append(
                     {
@@ -162,7 +166,8 @@ def group_summary(rows, group_keys):
 
 def write_csv(path, rows, fieldnames):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as csv_file:
+    # utf-8-sig writes a BOM so Excel decodes the "±" character correctly
+    with path.open("w", newline="", encoding="utf-8-sig") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows([{field: row.get(field, "") for field in fieldnames} for row in rows])
@@ -329,10 +334,12 @@ def main():
     if args.pair != "all":
         detailed_path = metrics_dir / "diffusion_metrics_detailed.csv"
         if detailed_path.exists():
-            with detailed_path.open(newline="", encoding="utf-8") as f:
+            # utf-8-sig strips the BOM written by write_csv so the "pair" key is intact.
+            with detailed_path.open(newline="", encoding="utf-8-sig") as f:
                 existing = list(csv.DictReader(f))
-            # Drop stale rows for the pairs being updated, then re-add fresh rows.
-            existing = [row for row in existing if row.get("pair") not in pairs]
+            # Keep only rows with a known pair (drops any rows corrupted by a prior
+            # BOM-encoding bug where the pair field was written as an empty string).
+            existing = [row for row in existing if row.get("pair") in PAIRS and row.get("pair") not in pairs]
             detailed = existing + detailed
         # Recalculate gan_found / baseline_found across ALL pairs in the merged data.
         gan_found = any(row.get("variant") == "gan" for row in detailed)

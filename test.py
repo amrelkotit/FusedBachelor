@@ -42,7 +42,7 @@ def summarize(rows):
     summary = {"image": "mean +/- std"}
     for field in METRIC_FIELDS:
         values = torch.tensor([float(row[field]) for row in rows], dtype=torch.float32)
-        summary[field] = f"{values.mean().item():.6f} +/- {values.std(unbiased=False).item():.6f}"
+        summary[field] = f"{values.mean().item():.3f}±{values.std(unbiased=False).item():.2f}"
     return summary
 
 
@@ -84,7 +84,8 @@ def metrics_for_pair(dataset, fused_dir, image_size):
 def write_metrics_csv(rows, path):
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = ["image", "source1_path", "source2_path", "fused_path", *METRIC_FIELDS]
-    with path.open("w", newline="", encoding="utf-8") as csv_file:
+    # utf-8-sig writes a BOM so Excel decodes the "±" character correctly
+    with path.open("w", newline="", encoding="utf-8-sig") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
@@ -105,7 +106,7 @@ def update_summary_files(metrics_dir):
     if not rows:
         return
     for filename in ("all_pairs_gan_summary.csv", "thesis_comparison_table.csv"):
-        with (metrics_dir / filename).open("w", newline="", encoding="utf-8") as csv_file:
+        with (metrics_dir / filename).open("w", newline="", encoding="utf-8-sig") as csv_file:
             writer = csv.DictWriter(csv_file, fieldnames=["pair", *METRIC_FIELDS])
             writer.writeheader()
             writer.writerows(rows)

@@ -80,6 +80,9 @@ PLOT_METRICS  = ["EN", "PSNR", "MI", "CC", "FMI"]
 
 def parse_mean_std(text: str) -> tuple[float, float]:
     text = str(text).strip()
+    if "±" in text:
+        parts = text.split("±", 1)
+        return float(parts[0].strip()), float(parts[1].strip())
     if "+/-" in text:
         parts = text.split("+/-", 1)
         return float(parts[0].strip()), float(parts[1].strip())
@@ -87,7 +90,7 @@ def parse_mean_std(text: str) -> tuple[float, float]:
 
 
 def fmt(mean: float, std: float) -> str:
-    return f"{mean:.6f} +/- {std:.6f}"
+    return f"{mean:.3f}±{std:.2f}"
 
 
 def correct_row(row: dict) -> dict:
